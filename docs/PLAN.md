@@ -1,5 +1,7 @@
 # Connection Pool Implementation Plan
 
+## Status: Phase 1-6 Complete, Phase 7 (tests) Pending
+
 ## Overview
 
 Implement a WebSocket connection pool for the client side with multi-connection support, QoS detection, weighted traffic distribution, and congestion control. Modify the relay server to support multiple connections per UUID.
@@ -11,7 +13,7 @@ Implement a WebSocket connection pool for the client side with multi-connection 
 - Client `bytesWritten` (upload) reflects the throttled direction
 - Per-connection limiting: each connection is independently throttled
 
-## Phase 1: Server Multi-Connection Support
+## Phase 1: Server Multi-Connection Support ✅
 
 **File: `internal/relay/server.go`**
 
@@ -23,7 +25,7 @@ Implement a WebSocket connection pool for the client side with multi-connection 
 - Keep heartbeat per-connection (unchanged)
 - Log total connection count per UUID on register/unregister
 
-## Phase 2: Connection State Tracking
+## Phase 2: ✅ Connection State Tracking
 
 **File: `internal/conn/connstate.go`**
 
@@ -44,7 +46,7 @@ Implement a WebSocket connection pool for the client side with multi-connection 
   - Once `throttled = true`, never reverts
 - Weight: `min(current/peak, 1.0)`, floor 0.1 for throttled connections
 
-## Phase 3: Timeout Detector
+## Phase 3: ✅ Timeout Detector
 
 **File: `internal/conn/timeout.go`**
 
@@ -61,7 +63,7 @@ Implement a WebSocket connection pool for the client side with multi-connection 
   - If detected > 0, return detected * 0.8
   - Default: 50s
 
-## Phase 4: Rate Limiter (Congestion Control)
+## Phase 4: ✅ Rate Limiter (Congestion Control)
 
 **File: `internal/conn/ratelimit.go`**
 
@@ -83,7 +85,7 @@ Implement a WebSocket connection pool for the client side with multi-connection 
   - If no further degradation detected → keep expanded
   - If degradation → revert
 
-## Phase 5: Connection Pool
+## Phase 5: ✅ Connection Pool
 
 **File: `internal/conn/pool.go`**
 
@@ -124,7 +126,7 @@ Implement a WebSocket connection pool for the client side with multi-connection 
   - Close all WebSocket connections
   - Wait for goroutines
 
-## Phase 6: Integration with Existing Client
+## Phase 6: ✅ Integration with Existing Client
 
 **File: `internal/conn/client.go`**
 
@@ -134,7 +136,7 @@ Implement a WebSocket connection pool for the client side with multi-connection 
 - Keep backward-compatible API
 - Remove old single-connection reconnect logic (pool handles it)
 
-## Phase 7: Tests
+## Phase 7: (pending) Tests
 
 **File: `internal/relay/server_test.go`**
 
