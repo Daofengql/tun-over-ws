@@ -1,4 +1,4 @@
-module github.com/daofeng/ws-vpn-go
+module github.com/Daofengql/tun-over-ws
 
 go 1.25
 

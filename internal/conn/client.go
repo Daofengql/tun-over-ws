@@ -12,9 +12,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 
-	"github.com/daofeng/ws-vpn-go/internal/logger"
-	"github.com/daofeng/ws-vpn-go/internal/packet"
-	"github.com/daofeng/ws-vpn-go/internal/tun"
+	"github.com/Daofengql/tun-over-ws/internal/logger"
+	"github.com/Daofengql/tun-over-ws/internal/packet"
+	"github.com/Daofengql/tun-over-ws/internal/tun"
 )
 
 const (

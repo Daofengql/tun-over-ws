@@ -10,7 +10,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/daofeng/ws-vpn-go/internal/config"
+	"github.com/Daofengql/tun-over-ws/internal/config"
 )
 
 func TestVIPAllocator(t *testing.T) {

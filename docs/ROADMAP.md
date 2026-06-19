@@ -55,13 +55,13 @@
 - WebSocket -> TUN 数据泵。
 - Linux TUN read/write 使用 `tunPacketOffset = 16`，修复 wireguard-go 后端的 offset 要求。
 - Windows 单机两客户端互 ping 验证通过：`ping -S 10.66.0.2 10.66.0.3`。
-- 远程 Linux/Windows overlay 验证通过：`ping -I 10.66.0.2 10.66.0.3`。
+- Linux/Windows overlay 验证通过。
 - `wintun.dll` 需放在 Windows 二进制同目录。
 
 待做：
 
 - 优雅退出时更完整地清理路由和 TUN 设备。
-- 将远程 overlay 测试流程沉淀为可重复脚本。
+- 将跨平台 overlay 测试流程沉淀为可重复脚本。
 - 增加 TUN 平台层的错误提示和诊断。
 
 ## 阶段 4：服务端出口

@@ -27,9 +27,9 @@ $ProjectDir = Split-Path -Parent $PSScriptRoot
 if (-not $ProjectDir) { $ProjectDir = $PSScriptRoot }
 $BinDir = Join-Path $ProjectDir "bin"
 $Exe = Join-Path $BinDir "wsvpn.exe"
-$ServerCfg = Join-Path $ProjectDir "testdata\server.yaml"
-$ClientACfg = Join-Path $ProjectDir "testdata\client-a.yaml"
-$ClientBCfg = Join-Path $ProjectDir "testdata\client-b.yaml"
+$ServerCfg = Join-Path $ProjectDir "configs\local\server.yaml"
+$ClientACfg = Join-Path $ProjectDir "configs\local\client-a.yaml"
+$ClientBCfg = Join-Path $ProjectDir "configs\local\client-b.yaml"
 $WintunDll = Join-Path $BinDir "wintun.dll"
 
 # Verify files exist

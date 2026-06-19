@@ -103,13 +103,13 @@ routes:
 
 ```powershell
 # 终端 1：服务端
-.\bin\wsvpn.exe server -c .\testdata\server.yaml --log-level debug
+.\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
 
 # 终端 2：客户端 A
-.\bin\wsvpn.exe client -c .\testdata\client-a.yaml --log-level debug
+.\bin\wsvpn.exe client -c .\configs\local\client-a.yaml --log-level debug
 
 # 终端 3：客户端 B
-.\bin\wsvpn.exe client -c .\testdata\client-b.yaml --log-level debug
+.\bin\wsvpn.exe client -c .\configs\local\client-b.yaml --log-level debug
 
 # 终端 4：指定源地址 ping
 ping -S 10.66.0.2 10.66.0.3
@@ -128,63 +128,9 @@ ping -S 10.66.0.2 10.66.0.3
 .\scripts\test-tun.ps1
 ```
 
-## 远程 Windows/Linux overlay 测试
+## Windows/Linux overlay 测试
 
-已验证拓扑：
-
-```text
-server: 47.250.198.120:27000
-linux client: 10.66.0.2
-windows client: 10.66.0.3
-overlay: 10.66.0.0/24
-```
-
-远程服务端配置示例：
-
-```yaml
-listen: ":27000"
-overlay_cidr: "10.66.0.0/24"
-server_tun:
-  enabled: false
-  name: "wsvpn0"
-  ip: "10.66.0.1"
-  mtu: 1280
-exit:
-  enabled: false
-auth:
-  tokens:
-    - "test-token-linux"
-    - "test-token-win"
-heartbeat:
-  interval: 30s
-```
-
-远程 Linux 客户端配置示例：
-
-```yaml
-server_url: "ws://127.0.0.1:27000/tunnel"
-uuid: "linux-client-00000000-0000-0000-0000-000000000001"
-token: "test-token-linux"
-tun:
-  name: "wsvpn0"
-  mtu: 1280
-routes:
-  exit:
-    enabled: false
-```
-
-远程 Linux 启动：
-
-```bash
-./wsvpn-linux-amd64 server -c server.yaml --log-level debug
-./wsvpn-linux-amd64 client -c client-linux.yaml --log-level debug
-```
-
-Windows 启动：
-
-```powershell
-.\bin\wsvpn.exe client -c .\testdata\client-windows-remote.yaml --log-level debug
-```
+跨平台测试使用本地配置文件，不在公开仓库中保存任何公网地址、连接 URL、临时 token 或主机信息。
 
 Linux 指定源接口测试：
 
@@ -200,9 +146,9 @@ ping -S 10.66.0.3 10.66.0.2
 
 不要修改 Linux 或 Windows 默认路由。当前测试只要求 overlay connected route 生效。
 
-## 停止远端测试进程
+## 停止测试进程
 
-远程测试时如果使用后台进程，可用这些命令收尾：
+如果使用后台进程，可用这些命令收尾：
 
 ```bash
 pkill -f 'wsvpn.*server'

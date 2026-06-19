@@ -30,44 +30,17 @@ Do not commit `bin/`, binaries, or `wintun.dll`.
 
 ```powershell
 # Terminal 1: server
-.\bin\wsvpn.exe server -c .\testdata\server.yaml --log-level debug
+.\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
 
 # Terminal 2: client A, usually 10.66.0.2
-.\bin\wsvpn.exe client -c .\testdata\client-a.yaml --log-level debug
+.\bin\wsvpn.exe client -c .\configs\local\client-a.yaml --log-level debug
 
 # Terminal 3: client B, usually 10.66.0.3
-.\bin\wsvpn.exe client -c .\testdata\client-b.yaml --log-level debug
+.\bin\wsvpn.exe client -c .\configs\local\client-b.yaml --log-level debug
 
 # Terminal 4: test
 ping -S 10.66.0.2 10.66.0.3
 ```
-
-## Run (remote Windows/Linux overlay test)
-
-Known test topology:
-
-```text
-server: 47.250.198.120:27000
-linux client vip: 10.66.0.2
-windows client vip: 10.66.0.3
-overlay: 10.66.0.0/24
-```
-
-Windows client:
-
-```powershell
-.\bin\wsvpn.exe client -c .\testdata\client-windows-remote.yaml --log-level debug
-ping -S 10.66.0.3 10.66.0.2
-```
-
-Linux client:
-
-```bash
-./wsvpn-linux-amd64 client -c client-linux.yaml --log-level debug
-ping -I 10.66.0.2 -c 4 -W 2 10.66.0.3
-```
-
-Do not change default routes for the current MVP. Use explicit ping source/interface.
 
 ## Architecture
 
@@ -96,7 +69,7 @@ Do not change default routes for the current MVP. Use explicit ping source/inter
 
 - Go code in `cmd/` and `internal/` only. No `.go` files in root.
 - Platform-specific code uses `_windows.go` / `_linux.go` suffixes.
-- Config files in `testdata/` for development.
+- Config files stay local under `configs/` or `testdata/`; do not commit them.
 - Keep docs honest about what has been tested versus what is planned.
 
 ## Known Edges

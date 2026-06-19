@@ -8,9 +8,9 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
-	"github.com/daofeng/ws-vpn-go/internal/config"
-	"github.com/daofeng/ws-vpn-go/internal/logger"
-	"github.com/daofeng/ws-vpn-go/internal/relay"
+	"github.com/Daofengql/tun-over-ws/internal/config"
+	"github.com/Daofengql/tun-over-ws/internal/logger"
+	"github.com/Daofengql/tun-over-ws/internal/relay"
 )
 
 var serverCmd = &cobra.Command{

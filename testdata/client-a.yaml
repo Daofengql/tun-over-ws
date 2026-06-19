@@ -1,9 +1,0 @@
-server_url: "ws://127.0.0.1:18443/tunnel"
-uuid: "client-a-00000000-0000-0000-0000-000000000001"
-token: "test-token-aaa"
-tun:
-  name: "wsvpn0"
-  mtu: 1280
-routes:
-  exit:
-    enabled: false

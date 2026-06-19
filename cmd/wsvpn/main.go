@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/daofeng/ws-vpn-go/internal/logger"
+	"github.com/Daofengql/tun-over-ws/internal/logger"
 	"github.com/spf13/cobra"
 )
 

@@ -9,7 +9,7 @@ This file describes the project conventions for AI agents working on this codeba
 ## Project Structure
 
 ```text
-ws-vpn-go/
+tun-over-ws/
   bin/                  # Build output (gitignored)
   cmd/wsvpn/            # CLI entry point (cobra)
     main.go             # Root command, logger setup
@@ -22,7 +22,7 @@ ws-vpn-go/
     packet/             # IPv4 packet parsing
     relay/              # Server relay, VIP allocator, forwarding, source validation
     tun/                # TUN device (wireguard-go), platform IP config
-  testdata/             # Development config files
+  configs/              # Local config files (gitignored)
   scripts/              # Helper scripts (test-tun.ps1)
   docs/                 # Design, operations, roadmap, handoff documents
 ```
@@ -33,7 +33,7 @@ ws-vpn-go/
 2. Platform-specific files use build tags through filename suffixes: `_windows.go`, `_linux.go`.
 3. Tests use standard `_test.go` naming. Run with `go test ./...`.
 4. Binary output goes to `bin/`. Never commit binaries or `wintun.dll`.
-5. Config examples go in `testdata/`.
+5. Local config files go in `configs/` or `testdata/`; both are gitignored.
 6. Use YAML only for config.
 7. Keep the current MVP overlay-only unless the user explicitly asks for exit gateway work.
 8. Do not treat UUID/token as production auth; they are test-stage fields and will be replaced later.
@@ -68,9 +68,9 @@ Remove-Item Env:\GOARCH
 Local Windows integration test requires admin PowerShell:
 
 ```powershell
-.\bin\wsvpn.exe server -c .\testdata\server.yaml --log-level debug
-.\bin\wsvpn.exe client -c .\testdata\client-a.yaml --log-level debug
-.\bin\wsvpn.exe client -c .\testdata\client-b.yaml --log-level debug
+.\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
+.\bin\wsvpn.exe client -c .\configs\local\client-a.yaml --log-level debug
+.\bin\wsvpn.exe client -c .\configs\local\client-b.yaml --log-level debug
 ping -S 10.66.0.2 10.66.0.3
 ```
 

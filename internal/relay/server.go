@@ -13,9 +13,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 
-	"github.com/daofeng/ws-vpn-go/internal/config"
-	"github.com/daofeng/ws-vpn-go/internal/logger"
-	"github.com/daofeng/ws-vpn-go/internal/packet"
+	"github.com/Daofengql/tun-over-ws/internal/config"
+	"github.com/Daofengql/tun-over-ws/internal/logger"
+	"github.com/Daofengql/tun-over-ws/internal/packet"
 )
 
 const pingInterval = 30 * time.Second

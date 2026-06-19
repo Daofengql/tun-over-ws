@@ -2,7 +2,7 @@
 
 ## 项目定位
 
-`ws-vpn-go` 是一个 Go 单二进制网络工具。它通过 TUN 虚拟网卡捕获三层 IPv4 包，再通过 WebSocket 与中心服务端建立隧道，实现 overlay 内网组网。
+`tun-over-ws` 是一个 Go 单二进制网络工具。它通过 TUN 虚拟网卡捕获三层 IPv4 包，再通过 WebSocket 与中心服务端建立隧道，实现 overlay 内网组网。
 
 这个项目不是传统应用层代理。传统代理通常处理 `CONNECT host:port` 或 SOCKS 请求；本项目处理的是完整 IP 包，数据平面更接近一个中心化 relay VPN。
 
@@ -37,23 +37,9 @@
 - Windows 构建通过：`go build -o bin\wsvpn.exe ./cmd/wsvpn`。
 - Linux amd64 构建通过：`GOOS=linux GOARCH=amd64 go build -o bin\wsvpn-linux-amd64 ./cmd/wsvpn`。
 - Windows 单机双客户端 overlay ping 通过。
-- 远程 Linux 服务端 + Linux 客户端 + 本机 Windows 客户端 overlay ping 通过。
+- Linux 服务端 + Linux 客户端 + Windows 客户端跨平台 overlay ping 通过。
 
-远程测试记录：
-
-```text
-server: 47.250.198.120:27000
-overlay: 10.66.0.0/24
-linux client vip: 10.66.0.2
-windows client vip: 10.66.0.3
-
-linux -> windows:
-ping -I 10.66.0.2 -c 4 -W 2 10.66.0.3
-4 packets transmitted, 4 received, 0% packet loss
-avg rtt about 240 ms
-```
-
-Windows -> Linux 测试中，Windows 客户端日志能看到 `10.66.0.3 -> 10.66.0.2` 的 ping 包进入 TUN 并发往 WebSocket；服务端日志能看到双向 overlay 转发。若后续需要复测，应以两端客户端日志和服务端 `forwarded` 日志共同判断。
+跨平台测试记录不在公开文档中保留具体公网地址、连接 URL、登录信息或临时机器信息。若后续需要复测，应以两端客户端日志和服务端 `forwarded` 日志共同判断。
 
 ## 当前不是重点的事情
 
@@ -196,7 +182,7 @@ route 128.0.0.0/1 -> TUN
 
 1. 补充 relay 的连接替换和并发注销单元测试。
 2. 补充 Linux TUN setup 的可观测性和失败提示。
-3. 把远程 Windows/Linux overlay ping 流程固定成脚本或半自动测试说明。
+3. 把 Windows/Linux overlay ping 流程固定成脚本或半自动测试说明。
 4. 引入服务端签名登录机制，替换测试 UUID/token。
 5. 设计 exit gateway 的 server TUN、NAT、权限和路由保护。
 6. 增加 metrics：连接数、转发包数、丢包原因、重连次数。
