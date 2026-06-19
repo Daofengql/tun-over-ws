@@ -206,3 +206,23 @@ func TestPoolMonitorBuildsStandbyOnSustainedWriteLatency(t *testing.T) {
 		t.Fatal("primary should be degraded after sustained high latency")
 	}
 }
+
+func TestPoolMonitorRotatesPrimaryOnCriticalLatency(t *testing.T) {
+	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p.maxTotal = 3
+	primary := newTestPooledConn(rolePrimary, 1)
+	standby := newTestPooledConn(roleStandby, 1)
+	primary.state.RecordWrite(1, criticalWriteLatency)
+	p.conns = []*pooledConn{primary, standby}
+
+	for i := 0; i < latencyCriticalTicks; i++ {
+		p.monitorTick(context.Background())
+	}
+
+	if primary.role != roleDraining {
+		t.Fatalf("old primary role: got %s want %s", primary.role, roleDraining)
+	}
+	if standby.role != rolePrimary {
+		t.Fatalf("standby role: got %s want %s", standby.role, rolePrimary)
+	}
+}

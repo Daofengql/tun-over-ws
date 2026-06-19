@@ -33,6 +33,8 @@ const (
 	queuePressureSamples = 3
 	highWriteLatency     = 2 * time.Second
 	latencyHighSamples   = 3
+	criticalWriteLatency = 5 * time.Second
+	latencyCriticalTicks = 3
 )
 
 type connRole string
@@ -74,10 +76,11 @@ type Pool struct {
 	virtualIP netip.Addr
 
 	maxTotal      int
-	pendingBuilds int
-	timeoutDetect *TimeoutDetector
-	pressureTicks int
-	latencyTicks  int
+	pendingBuilds        int
+	timeoutDetect        *TimeoutDetector
+	pressureTicks        int
+	latencyTicks         int
+	criticalLatencyTicks int
 
 	log zerolog.Logger
 }
@@ -613,6 +616,21 @@ func (p *Pool) monitorTick(ctx context.Context) {
 				Dur("write_latency_ewma", primary.state.WriteLatencyEWMA()).
 				Msg("primary write latency high")
 			p.scheduleBuildLocked(ctx)
+		}
+	}
+
+	// Critical sustained latency: actually rotate primary.
+	if primary := p.primaryLocked(); primary != nil && primary.state.WriteLatencyEWMA() >= criticalWriteLatency {
+		p.criticalLatencyTicks++
+	} else {
+		p.criticalLatencyTicks = 0
+	}
+	if p.criticalLatencyTicks >= latencyCriticalTicks {
+		if primary := p.primaryLocked(); primary != nil {
+			p.log.Warn().
+				Dur("write_latency_ewma", primary.state.WriteLatencyEWMA()).
+				Msg("critical sustained latency, rotating primary")
+			p.rotatePrimaryLocked(ctx, "critical_latency")
 		}
 	}
 
