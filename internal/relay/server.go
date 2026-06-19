@@ -35,8 +35,8 @@ type Server struct {
 	allocator *VIPAllocator
 
 	mu      sync.RWMutex
-	clients map[string]*client     // UUID -> client
-	vipMap  map[netip.Addr]*client // VIP -> client
+	clients map[string][]*client    // UUID -> connections
+	vipMap  map[netip.Addr][]*client // VIP -> connections
 
 	overlayCIDR *net.IPNet // pre-parsed for fast matching
 
@@ -63,8 +63,8 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 	return &Server{
 		cfg:         cfg,
 		allocator:   alloc,
-		clients:     make(map[string]*client),
-		vipMap:      make(map[netip.Addr]*client),
+		clients:     make(map[string][]*client),
+		vipMap:      make(map[netip.Addr][]*client),
 		overlayCIDR: cidr,
 		log:         logger.Logger.With().Str("component", "relay").Logger(),
 	}, nil
@@ -233,30 +233,56 @@ func (s *Server) registerClient(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If same UUID reconnects, close old connection.
-	if old, ok := s.clients[c.UUID]; ok {
-		s.log.Info().Str("uuid", c.UUID).Msg("replacing existing connection")
-		old.Conn.Close(websocket.StatusNormalClosure, "replaced by new connection")
-		delete(s.vipMap, old.VirtualIP)
-	}
+	s.clients[c.UUID] = append(s.clients[c.UUID], c)
+	s.vipMap[c.VirtualIP] = append(s.vipMap[c.VirtualIP], c)
 
-	s.clients[c.UUID] = c
-	s.vipMap[c.VirtualIP] = c
+	s.log.Info().
+		Str("uuid", c.UUID).
+		Str("vip", c.VirtualIP.String()).
+		Int("total_conns", len(s.clients[c.UUID])).
+		Msg("connection registered")
 }
 
 func (s *Server) unregisterClient(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	current, ok := s.clients[c.UUID]
-	if ok && current == c {
+	s.clients[c.UUID] = removeConn(s.clients[c.UUID], c)
+	s.vipMap[c.VirtualIP] = removeConn(s.vipMap[c.VirtualIP], c)
+
+	if len(s.clients[c.UUID]) == 0 {
 		delete(s.clients, c.UUID)
 		delete(s.vipMap, c.VirtualIP)
-		s.log.Info().
-			Str("uuid", c.UUID).
-			Str("vip", c.VirtualIP.String()).
-			Msg("client disconnected")
 	}
+
+	s.log.Info().
+		Str("uuid", c.UUID).
+		Str("vip", c.VirtualIP.String()).
+		Int("remaining_conns", len(s.clients[c.UUID])).
+		Msg("connection unregistered")
+}
+
+func removeConn(list []*client, target *client) []*client {
+	for i, c := range list {
+		if c == target {
+			return append(list[:i], list[i+1:]...)
+		}
+	}
+	return list
+}
+
+// selectBest picks the connection with the most available WriteCh capacity.
+func selectBest(conns []*client) *client {
+	best := conns[0]
+	bestAvail := cap(best.WriteCh) - len(best.WriteCh)
+	for _, c := range conns[1:] {
+		avail := cap(c.WriteCh) - len(c.WriteCh)
+		if avail > bestAvail {
+			best = c
+			bestAvail = avail
+		}
+	}
+	return best
 }
 
 // serverHeartbeat sends periodic pings to detect dead clients.
@@ -321,10 +347,10 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 	// Check overlay: is destination in our CIDR?
 	if s.overlayCIDR.Contains(dst.AsSlice()) {
 		s.mu.RLock()
-		target, ok := s.vipMap[dst]
+		conns := s.vipMap[dst]
 		s.mu.RUnlock()
 
-		if !ok {
+		if len(conns) == 0 {
 			s.log.Debug().
 				Str("from", from.VirtualIP.String()).
 				Str("dst", dst.String()).
@@ -332,17 +358,21 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 			return
 		}
 
+		// Select connection with most available WriteCh space.
+		target := selectBest(conns)
+
 		select {
 		case target.WriteCh <- raw:
 			s.log.Debug().
 				Str("from", from.VirtualIP.String()).
 				Str("dst", dst.String()).
 				Int("bytes", len(raw)).
+				Int("queue", len(target.WriteCh)).
 				Msg("forwarded")
 		default:
 			s.log.Warn().
 				Str("dst", dst.String()).
-				Msg("target write channel full, dropping")
+				Msg("all connections full, dropping")
 		}
 		return
 	}
