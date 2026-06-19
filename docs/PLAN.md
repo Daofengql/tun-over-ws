@@ -295,6 +295,7 @@ Tasks:
 
 - Pick inferred primary for TCP forwarding. The first alive connection for a VIP is treated as primary.
 - Use blocking or longer-wait enqueue for TCP.
+- Wake TCP enqueue waits when the inferred primary closes, then retry selection so a standby can receive the packet.
 - Keep UDP lossy and allow standby burst.
 
 Explicit client-to-server role synchronization is not implemented yet. The server infers primary as the first alive connection for that VIP.
@@ -336,6 +337,7 @@ Tests to add or update:
 - Primary rotation promotes standby and marks the old primary as draining. ✅
 - Timeout rotation triggers planned promotion. ✅
 - Server forwarding does not immediately drop TCP on full target queue. ✅
+- Server TCP forwarding retries a standby if the inferred primary closes while a sender is waiting. ✅
 - Connection-state counters, timestamps, queue snapshots, and write latency EWMA are covered by unit tests. ✅
 - Existing unit tests pass. ✅
 

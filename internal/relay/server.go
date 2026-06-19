@@ -35,6 +35,8 @@ type client struct {
 	RemoteAddr string
 	writeMu    sync.Mutex
 	closed     atomic.Bool
+	closeOnce  sync.Once
+	done       chan struct{}
 }
 
 // Server is the WebSocket relay server.
@@ -154,6 +156,7 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 		Conn:       conn,
 		WriteCh:    make(chan []byte, 512),
 		RemoteAddr: remoteAddr,
+		done:       make(chan struct{}),
 	}
 	s.registerClient(c)
 	defer s.unregisterClient(c)
@@ -254,7 +257,7 @@ func (s *Server) unregisterClient(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	c.closed.Store(true)
+	c.markClosed()
 	s.clients[c.UUID] = removeConn(s.clients[c.UUID], c)
 	s.vipMap[c.VirtualIP] = removeConn(s.vipMap[c.VirtualIP], c)
 
@@ -283,7 +286,7 @@ func removeConn(list []*client, target *client) []*client {
 
 func selectPrimary(conns []*client) *client {
 	for _, c := range conns {
-		if !c.closed.Load() {
+		if !c.isClosed() {
 			return c
 		}
 	}
@@ -294,7 +297,7 @@ func selectBestStandby(conns []*client, primary *client) *client {
 	var best *client
 	bestAvail := -1
 	for _, c := range conns {
-		if c == primary || c.closed.Load() {
+		if c == primary || c.isClosed() {
 			continue
 		}
 		avail := cap(c.WriteCh) - len(c.WriteCh)
@@ -323,7 +326,7 @@ func (s *Server) serverHeartbeat(ctx context.Context, c *client) {
 			cancel()
 			if err != nil {
 				s.log.Warn().Err(err).Str("uuid", c.UUID).Msg("client ping failed")
-				c.closed.Store(true)
+				c.markClosed()
 				c.Conn.Close(websocket.StatusNormalClosure, "ping timeout")
 				return
 			}
@@ -335,7 +338,7 @@ func (s *Server) readLoop(ctx context.Context, c *client) {
 	for {
 		msgType, data, err := c.Conn.Read(ctx)
 		if err != nil {
-			c.closed.Store(true)
+			c.markClosed()
 			s.log.Debug().Err(err).Str("uuid", c.UUID).Msg("read loop ended")
 			return
 		}
@@ -431,20 +434,28 @@ func (s *Server) enqueueOverlay(ctx context.Context, conns []*client, pkt *packe
 }
 
 func (s *Server) enqueueTCP(ctx context.Context, conns []*client, raw []byte) bool {
-	target := selectPrimary(conns)
-	if target == nil {
-		return false
-	}
-
 	timer := time.NewTimer(relayTCPEnqueueWait)
 	defer timer.Stop()
-	select {
-	case target.WriteCh <- raw:
-		return true
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return false
+
+	for {
+		target := selectPrimary(conns)
+		if target == nil {
+			return false
+		}
+		if target.isClosed() {
+			continue
+		}
+
+		select {
+		case target.WriteCh <- raw:
+			return !target.isClosed()
+		case <-target.doneCh():
+			continue
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return false
+		}
 	}
 }
 
@@ -473,9 +484,14 @@ func (s *Server) enqueueUDP(ctx context.Context, conns []*client, raw []byte) bo
 
 	timer := time.NewTimer(relayUDPEnqueueWait)
 	defer timer.Stop()
+	if primary.isClosed() {
+		return false
+	}
 	select {
 	case primary.WriteCh <- raw:
-		return true
+		return !primary.isClosed()
+	case <-primary.doneCh():
+		return false
 	case <-ctx.Done():
 		return false
 	case <-timer.C:
@@ -484,20 +500,28 @@ func (s *Server) enqueueUDP(ctx context.Context, conns []*client, raw []byte) bo
 }
 
 func (s *Server) enqueuePrimaryWithTimeout(ctx context.Context, conns []*client, raw []byte, timeout time.Duration) bool {
-	target := selectPrimary(conns)
-	if target == nil {
-		return false
-	}
-
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case target.WriteCh <- raw:
-		return true
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return false
+
+	for {
+		target := selectPrimary(conns)
+		if target == nil {
+			return false
+		}
+		if target.isClosed() {
+			continue
+		}
+
+		select {
+		case target.WriteCh <- raw:
+			return !target.isClosed()
+		case <-target.doneCh():
+			continue
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return false
+		}
 	}
 }
 
@@ -516,10 +540,33 @@ func (s *Server) writeLoop(ctx context.Context, c *client) {
 			c.writeMu.Unlock()
 			cancel()
 			if err != nil {
-				c.closed.Store(true)
+				c.markClosed()
 				s.log.Debug().Err(err).Str("uuid", c.UUID).Msg("write failed")
 				return
 			}
 		}
 	}
+}
+
+func (c *client) isClosed() bool {
+	return c == nil || c.closed.Load()
+}
+
+func (c *client) markClosed() {
+	if c == nil {
+		return
+	}
+	c.closed.Store(true)
+	c.closeOnce.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
+	})
+}
+
+func (c *client) doneCh() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c.done
 }

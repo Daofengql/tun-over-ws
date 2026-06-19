@@ -437,17 +437,35 @@ func (p *Pool) burstCandidates() []*pooledConn {
 }
 
 func (p *Pool) ensurePrimaryLocked(ctx context.Context) {
-	for _, pc := range p.conns {
-		if pc.role == rolePrimary && pc.isAlive() {
-			return
-		}
+	if primary := p.normalizePrimaryLocked(); primary != nil {
+		return
 	}
-	if promoted := p.promoteStandbyLocked(); promoted != nil {
-		p.log.Info().Str("vip", promoted.vip.String()).Msg("standby promoted to primary")
-		p.scheduleBuildLocked(ctx)
+	if ctx.Err() != nil {
 		return
 	}
 	p.scheduleBuildLocked(ctx)
+}
+
+func (p *Pool) normalizePrimaryLocked() *pooledConn {
+	var primary *pooledConn
+	for _, pc := range p.conns {
+		if !pc.isAlive() || pc.role != rolePrimary {
+			continue
+		}
+		if primary == nil {
+			primary = pc
+		} else {
+			pc.role = roleStandby
+		}
+	}
+	if primary != nil {
+		return primary
+	}
+	if promoted := p.promoteStandbyLocked(); promoted != nil {
+		p.log.Info().Str("vip", promoted.vip.String()).Msg("standby promoted to primary")
+		return promoted
+	}
+	return nil
 }
 
 func (p *Pool) promoteStandbyLocked() *pooledConn {

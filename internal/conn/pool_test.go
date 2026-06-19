@@ -90,6 +90,32 @@ func TestPoolPromotesStandbyWhenPrimaryDead(t *testing.T) {
 	}
 }
 
+func TestPoolNormalizePrimaryKeepsOnePrimary(t *testing.T) {
+	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	first := newTestPooledConn(rolePrimary, 1)
+	second := newTestPooledConn(rolePrimary, 1)
+	standby := newTestPooledConn(roleStandby, 1)
+	p.conns = []*pooledConn{first, second, standby}
+
+	got := p.normalizePrimaryLocked()
+	if got != first {
+		t.Fatal("normalizePrimaryLocked did not keep the first alive primary")
+	}
+
+	primaryCount := 0
+	for _, pc := range p.conns {
+		if pc.role == rolePrimary {
+			primaryCount++
+		}
+	}
+	if primaryCount != 1 {
+		t.Fatalf("primary count: got %d want 1", primaryCount)
+	}
+	if second.role != roleStandby {
+		t.Fatalf("second primary role: got %s want %s", second.role, roleStandby)
+	}
+}
+
 func TestPoolEnsureStandbysRespectsMaxTotal(t *testing.T) {
 	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
 	p.maxTotal = 3

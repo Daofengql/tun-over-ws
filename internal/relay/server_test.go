@@ -78,6 +78,13 @@ func buildTestPacketWithProtocol(src, dst netip.Addr, protocol uint8) []byte {
 	return pkt
 }
 
+func newTestRelayClient(queueSize int) *client {
+	return &client{
+		WriteCh: make(chan []byte, queueSize),
+		done:    make(chan struct{}),
+	}
+}
+
 func TestRelayForwarding(t *testing.T) {
 	// Start server.
 	cfg := &config.ServerConfig{}
@@ -198,9 +205,7 @@ func parseIPv4Simple(data []byte) (*simplePkt, error) {
 
 func TestServerEnqueueTCPWaitsForPrimaryQueue(t *testing.T) {
 	srv := &Server{}
-	primary := &client{
-		WriteCh: make(chan []byte, 1),
-	}
+	primary := newTestRelayClient(1)
 	primary.WriteCh <- []byte("queued")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -231,8 +236,8 @@ func TestServerEnqueueTCPWaitsForPrimaryQueue(t *testing.T) {
 
 func TestServerEnqueueUDPUsesStandbyWhenPrimaryFull(t *testing.T) {
 	srv := &Server{}
-	primary := &client{WriteCh: make(chan []byte, 1)}
-	standby := &client{WriteCh: make(chan []byte, 1)}
+	primary := newTestRelayClient(1)
+	standby := newTestRelayClient(1)
 	primary.WriteCh <- []byte("queued")
 
 	if ok := srv.enqueueUDP(context.Background(), []*client{primary, standby}, []byte("udp")); !ok {
@@ -243,5 +248,38 @@ func TestServerEnqueueUDPUsesStandbyWhenPrimaryFull(t *testing.T) {
 	}
 	if got := string(<-standby.WriteCh); got != "udp" {
 		t.Fatalf("standby packet: got %q want udp", got)
+	}
+}
+
+func TestServerEnqueueTCPRetriesStandbyWhenPrimaryCloses(t *testing.T) {
+	srv := &Server{}
+	primary := newTestRelayClient(1)
+	standby := newTestRelayClient(1)
+	primary.WriteCh <- []byte("queued")
+
+	result := make(chan bool, 1)
+	go func() {
+		result <- srv.enqueueTCP(context.Background(), []*client{primary, standby}, []byte("tcp"))
+	}()
+
+	select {
+	case got := <-result:
+		t.Fatalf("enqueueTCP returned before primary closed: %v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	primary.markClosed()
+
+	select {
+	case got := <-result:
+		if !got {
+			t.Fatal("enqueueTCP returned false after standby became target")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("enqueueTCP did not retry standby after primary closed")
+	}
+
+	if got := string(<-standby.WriteCh); got != "tcp" {
+		t.Fatalf("standby packet: got %q want tcp", got)
 	}
 }
