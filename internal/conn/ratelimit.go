@@ -21,8 +21,8 @@ type RateLimiter struct {
 	lastTick time.Time
 
 	// Recovery probing.
-	lastProbe   time.Time
-	probing     bool
+	lastProbe     time.Time
+	probing       bool
 	probeCapacity float64 // temporary expanded capacity during probe
 }
 
@@ -33,9 +33,9 @@ func NewRateLimiter(initialCapacity float64) *RateLimiter {
 	}
 	now := time.Now()
 	return &RateLimiter{
-		capacity: initialCapacity,
-		tokens:   initialCapacity, // start full
-		lastTick: now,
+		capacity:  initialCapacity,
+		tokens:    initialCapacity, // start full
+		lastTick:  now,
 		lastProbe: now,
 	}
 }
@@ -74,17 +74,35 @@ func (rl *RateLimiter) UpdateCapacity(conns []*ConnState) {
 	defer rl.mu.Unlock()
 
 	var totalCurrent float64
+	var totalPeak float64
 	allThrottled := true
 	for _, cs := range conns {
 		totalCurrent += cs.CurrentThroughput()
+		totalPeak += cs.PeakThroughput()
 		if !cs.IsThrottled() {
 			allThrottled = false
 		}
 	}
 
-	newCap := totalCurrent * capacityHeadroom
-	if newCap < minCapacityBytesSec {
-		newCap = minCapacityBytesSec
+	newCap := rl.capacity
+	if allThrottled {
+		newCap = totalCurrent * capacityHeadroom
+		if newCap < minCapacityBytesSec {
+			newCap = minCapacityBytesSec
+		}
+	} else {
+		if totalPeak > 0 {
+			peakCap := totalPeak * capacityHeadroom
+			if peakCap > newCap {
+				newCap = peakCap
+			}
+		}
+		if totalCurrent > 0 {
+			demandCap := totalCurrent * probeMultiplier
+			if demandCap > newCap {
+				newCap = demandCap
+			}
+		}
 	}
 
 	// If probing and no further degradation, keep expanded capacity.

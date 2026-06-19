@@ -7,46 +7,60 @@ import (
 	"math/rand"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 
 	"github.com/Daofengql/tun-over-ws/internal/logger"
+	"github.com/Daofengql/tun-over-ws/internal/packet"
 	"github.com/Daofengql/tun-over-ws/internal/tun"
 )
 
 const (
-	defaultMaxActive = 2
-	defaultMaxTotal  = 3
-	writeChSize      = 512
-	monitorInterval  = 1 * time.Second
+	defaultMaxActive    = 2
+	defaultMaxTotal     = 3
+	writeChSize         = 512
+	monitorInterval     = 1 * time.Second
 	stateUpdateInterval = 200 * time.Millisecond
+	connectionTimeout   = 15 * time.Second
+	poolPingInterval    = 30 * time.Second
+	poolReadTimeout     = 90 * time.Second
+	poolWriteTimeout    = 5 * time.Second
 )
 
 // pooledConn wraps a WebSocket connection with its state.
 type pooledConn struct {
-	ws    *websocket.Conn
-	state *ConnState
+	ws      *websocket.Conn
+	state   *ConnState
 	writeCh chan []byte
-	vip   netip.Addr
-	alive bool
+	vip     netip.Addr
+
+	writeMu   sync.Mutex
+	alive     atomic.Bool
+	closeOnce sync.Once
+	cancel    context.CancelFunc
 }
 
 // Pool manages multiple WebSocket connections with QoS-aware routing.
 type Pool struct {
-	mu   sync.RWMutex
-	conns []*pooledConn
+	mu         sync.RWMutex
+	tunWriteMu sync.Mutex
+	conns      []*pooledConn
 
 	serverURL string
 	uuid      string
 	token     string
+	tunName   string
+	mtu       int
 
 	tunDev    *tun.Device
 	virtualIP netip.Addr
 
 	maxActive     int
 	maxTotal      int
+	pendingBuilds int
 	timeoutDetect *TimeoutDetector
 	rateLimiter   *RateLimiter
 
@@ -54,11 +68,19 @@ type Pool struct {
 }
 
 // NewPool creates a connection pool.
-func NewPool(serverURL, uuid, token string) *Pool {
+func NewPool(serverURL, uuid, token, tunName string, mtu int) *Pool {
+	if tunName == "" {
+		tunName = "wsvpn0"
+	}
+	if mtu <= 0 {
+		mtu = tun.DefaultMTU
+	}
 	return &Pool{
 		serverURL:     serverURL,
 		uuid:          uuid,
 		token:         token,
+		tunName:       tunName,
+		mtu:           mtu,
 		maxActive:     defaultMaxActive,
 		maxTotal:      defaultMaxTotal,
 		timeoutDetect: NewTimeoutDetector(0),
@@ -76,22 +98,19 @@ func (p *Pool) Connect(ctx context.Context) error {
 	p.virtualIP = pc.vip
 
 	// Create TUN.
-	dev, err := tun.Create("wsvpn0", 1280)
+	dev, err := tun.Create(p.tunName, p.mtu)
 	if err != nil {
-		pc.ws.CloseNow()
+		pc.close()
 		return fmt.Errorf("create tun: %w", err)
 	}
 	p.tunDev = dev
 	if err := dev.SetupIP(pc.vip.String()); err != nil {
 		dev.Close()
-		pc.ws.CloseNow()
+		pc.close()
 		return fmt.Errorf("setup tun ip: %w", err)
 	}
 
-	// Start write and read loops for this connection.
-	go p.writeConn(ctx, pc)
-	go p.readConn(ctx, pc)
-
+	p.startConn(ctx, pc)
 	p.mu.Lock()
 	p.conns = append(p.conns, pc)
 	p.mu.Unlock()
@@ -108,6 +127,11 @@ func (p *Pool) Connect(ctx context.Context) error {
 // VirtualIP returns the allocated virtual IP.
 func (p *Pool) VirtualIP() netip.Addr {
 	return p.virtualIP
+}
+
+// TunName returns the configured TUN interface name.
+func (p *Pool) TunName() string {
+	return p.tunName
 }
 
 // Run starts the pool: TUN pump, connection monitor, and state updater.
@@ -156,7 +180,11 @@ func (p *Pool) Run(ctx context.Context) error {
 
 // tunToPool reads packets from TUN and dispatches to the best connection.
 func (p *Pool) tunToPool(ctx context.Context) {
-	buf := make([]byte, 1500)
+	bufSize := p.mtu
+	if bufSize < 1500 {
+		bufSize = 1500
+	}
+	buf := make([]byte, bufSize)
 	for {
 		select {
 		case <-ctx.Done():
@@ -189,6 +217,10 @@ func (p *Pool) tunToPool(ctx context.Context) {
 			p.log.Warn().Msg("no available connection, dropping")
 			continue
 		}
+		if !pc.isAlive() {
+			p.log.Debug().Msg("selected connection died before dispatch")
+			continue
+		}
 
 		select {
 		case pc.writeCh <- raw:
@@ -201,13 +233,13 @@ func (p *Pool) tunToPool(ctx context.Context) {
 // readConn reads from a single connection and writes to TUN.
 func (p *Pool) readConn(ctx context.Context, pc *pooledConn) {
 	for {
-		msgType, data, err := pc.ws.Read(ctx)
+		msgType, data, err := pc.read(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			p.log.Debug().Err(err).Msg("conn read ended")
-			pc.alive = false
+			pc.close()
 			return
 		}
 
@@ -215,8 +247,24 @@ func (p *Pool) readConn(ctx context.Context, pc *pooledConn) {
 			continue
 		}
 
+		pkt, err := packet.ParseIPv4(data)
+		if err != nil {
+			p.log.Debug().Err(err).Msg("invalid packet from server")
+			continue
+		}
+		p.log.Debug().
+			Str("src", pkt.SrcAddr.String()).
+			Str("dst", pkt.DstAddr.String()).
+			Int("bytes", len(data)).
+			Msg("ws -> tun")
+
 		if p.tunDev != nil {
-			p.tunDev.Write(data)
+			p.tunWriteMu.Lock()
+			_, err = p.tunDev.Write(data)
+			p.tunWriteMu.Unlock()
+			if err != nil {
+				p.log.Error().Err(err).Msg("tun write failed")
+			}
 		}
 	}
 }
@@ -227,16 +275,37 @@ func (p *Pool) writeConn(ctx context.Context, pc *pooledConn) {
 		select {
 		case <-ctx.Done():
 			return
-		case data := <-pc.writeCh:
-			writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			err := pc.ws.Write(writeCtx, websocket.MessageBinary, data)
-			cancel()
+		case data, ok := <-pc.writeCh:
+			if !ok {
+				return
+			}
+			err := pc.write(ctx, data)
 			if err != nil {
 				p.log.Debug().Err(err).Msg("conn write failed")
-				pc.alive = false
+				pc.close()
 				return
 			}
 			pc.state.RecordBytes(len(data))
+		}
+	}
+}
+
+// heartbeatConn sends periodic WebSocket pings for a pooled connection.
+func (p *Pool) heartbeatConn(ctx context.Context, pc *pooledConn) {
+	ticker := time.NewTicker(poolPingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := pc.ping(ctx)
+			if err != nil {
+				p.log.Warn().Err(err).Msg("connection heartbeat failed")
+				pc.close()
+				return
+			}
 		}
 	}
 }
@@ -255,7 +324,7 @@ func (p *Pool) selectConn() *pooledConn {
 	var totalWeight float64
 
 	for _, pc := range p.conns {
-		if !pc.alive {
+		if !pc.isAlive() {
 			continue
 		}
 		w := pc.state.Weight()
@@ -307,7 +376,7 @@ func (p *Pool) monitorTick(ctx context.Context) {
 	alive := 0
 	throttled := 0
 	for _, pc := range p.conns {
-		if pc.alive {
+		if pc.isAlive() {
 			alive++
 			if pc.state.IsThrottled() {
 				throttled++
@@ -318,14 +387,30 @@ func (p *Pool) monitorTick(ctx context.Context) {
 	// Remove dead connections.
 	var live []*pooledConn
 	for _, pc := range p.conns {
-		if pc.alive {
+		if pc.isAlive() {
 			live = append(live, pc)
 		} else {
 			p.timeoutDetect.RecordDisconnect(pc.state.Age())
-			pc.ws.CloseNow()
+			pc.close()
 		}
 	}
 	p.conns = live
+	alive = 0
+	throttled = 0
+	for _, pc := range live {
+		if pc.isAlive() {
+			alive++
+			if pc.state.IsThrottled() {
+				throttled++
+			}
+		}
+	}
+
+	if alive == 0 {
+		p.log.Warn().Msg("no alive connections, rebuilding")
+		p.scheduleBuildLocked(ctx)
+		return
+	}
 
 	// Check rotation: if oldest active connection is near timeout limit.
 	rotationInterval := p.timeoutDetect.GetRotationInterval()
@@ -335,7 +420,7 @@ func (p *Pool) monitorTick(ctx context.Context) {
 				Dur("age", pc.state.Age()).
 				Dur("rotation", rotationInterval).
 				Msg("rotation threshold reached, building standby")
-			go p.buildStandby(ctx)
+			p.scheduleBuildLocked(ctx)
 			break
 		}
 	}
@@ -343,13 +428,13 @@ func (p *Pool) monitorTick(ctx context.Context) {
 	// If all active are throttled and we have capacity, build more.
 	if throttled == alive && alive > 0 && len(p.conns) < p.maxTotal {
 		p.log.Info().Int("throttled", throttled).Msg("all throttled, building new conn")
-		go p.buildStandby(ctx)
+		p.scheduleBuildLocked(ctx)
 	}
 
 	// Update rate limiter.
 	var states []*ConnState
 	for _, pc := range p.conns {
-		if pc.alive {
+		if pc.isAlive() {
 			states = append(states, pc.state)
 		}
 	}
@@ -358,8 +443,22 @@ func (p *Pool) monitorTick(ctx context.Context) {
 	}
 }
 
+func (p *Pool) scheduleBuildLocked(ctx context.Context) {
+	if len(p.conns)+p.pendingBuilds >= p.maxTotal {
+		return
+	}
+	p.pendingBuilds++
+	go p.buildStandby(ctx)
+}
+
 // buildStandby creates a new connection and adds it to the pool.
 func (p *Pool) buildStandby(ctx context.Context) {
+	defer func() {
+		p.mu.Lock()
+		p.pendingBuilds--
+		p.mu.Unlock()
+	}()
+
 	pc, err := p.buildConn(ctx)
 	if err != nil {
 		p.log.Error().Err(err).Msg("build standby failed")
@@ -369,28 +468,38 @@ func (p *Pool) buildStandby(ctx context.Context) {
 	p.mu.Lock()
 	if len(p.conns) >= p.maxTotal {
 		p.mu.Unlock()
-		pc.ws.CloseNow()
+		pc.close()
+		return
+	}
+	if p.virtualIP.IsValid() && pc.vip != p.virtualIP {
+		p.mu.Unlock()
+		p.log.Error().
+			Str("expected", p.virtualIP.String()).
+			Str("got", pc.vip.String()).
+			Msg("standby VIP mismatch")
+		pc.close()
 		return
 	}
 	p.conns = append(p.conns, pc)
 	p.log.Info().Int("pool_size", len(p.conns)).Msg("standby added")
 	p.mu.Unlock()
 
-	// Start read and write loops for this connection.
-	go p.writeConn(ctx, pc)
-	go p.readConn(ctx, pc)
+	p.startConn(ctx, pc)
 }
 
 // buildConn performs WebSocket dial + hello handshake.
 func (p *Pool) buildConn(ctx context.Context) (*pooledConn, error) {
 	p.log.Info().Str("url", p.serverURL).Msg("building connection")
 
-	wsConn, _, err := websocket.Dial(ctx, p.serverURL, nil)
+	connCtx, cancel := context.WithTimeout(ctx, connectionTimeout)
+	defer cancel()
+
+	wsConn, _, err := websocket.Dial(connCtx, p.serverURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("websocket dial: %w", err)
 	}
 
-	vip, err := p.hello(ctx, wsConn)
+	vip, err := p.hello(connCtx, wsConn)
 	if err != nil {
 		wsConn.CloseNow()
 		return nil, err
@@ -401,8 +510,8 @@ func (p *Pool) buildConn(ctx context.Context) (*pooledConn, error) {
 		state:   NewConnState(),
 		writeCh: make(chan []byte, writeChSize),
 		vip:     vip,
-		alive:   true,
 	}
+	pc.alive.Store(true)
 
 	p.log.Info().Str("vip", vip.String()).Msg("connection built")
 	return pc, nil
@@ -451,9 +560,7 @@ func (p *Pool) closeAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, pc := range p.conns {
-		pc.alive = false
-		pc.ws.CloseNow()
-		close(pc.writeCh)
+		pc.close()
 	}
 	p.conns = nil
 }
@@ -475,4 +582,48 @@ func (p *Pool) stateUpdater(ctx context.Context) {
 			p.mu.RUnlock()
 		}
 	}
+}
+
+func (p *Pool) startConn(parent context.Context, pc *pooledConn) {
+	connCtx, cancel := context.WithCancel(parent)
+	pc.cancel = cancel
+	go p.writeConn(connCtx, pc)
+	go p.readConn(connCtx, pc)
+	go p.heartbeatConn(connCtx, pc)
+}
+
+func (pc *pooledConn) isAlive() bool {
+	return pc.alive.Load()
+}
+
+func (pc *pooledConn) close() {
+	pc.closeOnce.Do(func() {
+		pc.alive.Store(false)
+		if pc.cancel != nil {
+			pc.cancel()
+		}
+		pc.ws.CloseNow()
+	})
+}
+
+func (pc *pooledConn) read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	readCtx, cancel := context.WithTimeout(ctx, poolReadTimeout)
+	defer cancel()
+	return pc.ws.Read(readCtx)
+}
+
+func (pc *pooledConn) write(ctx context.Context, data []byte) error {
+	writeCtx, cancel := context.WithTimeout(ctx, poolWriteTimeout)
+	defer cancel()
+	pc.writeMu.Lock()
+	defer pc.writeMu.Unlock()
+	return pc.ws.Write(writeCtx, websocket.MessageBinary, data)
+}
+
+func (pc *pooledConn) ping(ctx context.Context) error {
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	pc.writeMu.Lock()
+	defer pc.writeMu.Unlock()
+	return pc.ws.Ping(pingCtx)
 }

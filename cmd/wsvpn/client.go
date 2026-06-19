@@ -38,7 +38,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool := conn.NewPool(cfg.ServerURL, cfg.UUID, cfg.Token)
+	pool := conn.NewPool(cfg.ServerURL, cfg.UUID, cfg.Token, cfg.TUN.Name, cfg.TUN.MTU)
 
 	if err := pool.Connect(ctx); err != nil {
 		log.Fatal().Err(err).Msg("connect")
@@ -46,7 +46,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 
 	logger.Logger.Info().
 		Str("vip", pool.VirtualIP().String()).
-		Str("tun", cfg.TUN.Name).
+		Str("tun", pool.TunName()).
 		Msg("client ready")
 
 	return pool.Run(ctx)

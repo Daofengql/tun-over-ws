@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -27,6 +28,8 @@ type client struct {
 	Conn       *websocket.Conn
 	WriteCh    chan []byte
 	RemoteAddr string
+	writeMu    sync.Mutex
+	closed     atomic.Bool
 }
 
 // Server is the WebSocket relay server.
@@ -35,7 +38,7 @@ type Server struct {
 	allocator *VIPAllocator
 
 	mu      sync.RWMutex
-	clients map[string][]*client    // UUID -> connections
+	clients map[string][]*client     // UUID -> connections
 	vipMap  map[netip.Addr][]*client // VIP -> connections
 
 	overlayCIDR *net.IPNet // pre-parsed for fast matching
@@ -135,12 +138,11 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 	// Step 3: Send hello_ok.
 	if err := s.sendHelloOK(ctx, conn, vip); err != nil {
 		s.log.Error().Err(err).Str("uuid", uuid).Msg("send hello_ok failed")
-		s.allocator.Release(uuid)
 		conn.Close(websocket.StatusInternalError, "hello_ok failed")
 		return
 	}
 
-	// Step 4: Register client (replace existing if same UUID).
+	// Step 4: Register client. Multiple connections may share one UUID/VIP.
 	c := &client{
 		UUID:       uuid,
 		VirtualIP:  vip,
@@ -247,11 +249,14 @@ func (s *Server) unregisterClient(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	c.closed.Store(true)
 	s.clients[c.UUID] = removeConn(s.clients[c.UUID], c)
 	s.vipMap[c.VirtualIP] = removeConn(s.vipMap[c.VirtualIP], c)
 
 	if len(s.clients[c.UUID]) == 0 {
 		delete(s.clients, c.UUID)
+	}
+	if len(s.vipMap[c.VirtualIP]) == 0 {
 		delete(s.vipMap, c.VirtualIP)
 	}
 
@@ -271,11 +276,14 @@ func removeConn(list []*client, target *client) []*client {
 	return list
 }
 
-// selectBest picks the connection with the most available WriteCh capacity.
+// selectBest picks the open connection with the most available WriteCh capacity.
 func selectBest(conns []*client) *client {
-	best := conns[0]
-	bestAvail := cap(best.WriteCh) - len(best.WriteCh)
-	for _, c := range conns[1:] {
+	var best *client
+	bestAvail := -1
+	for _, c := range conns {
+		if c.closed.Load() {
+			continue
+		}
 		avail := cap(c.WriteCh) - len(c.WriteCh)
 		if avail > bestAvail {
 			best = c
@@ -296,10 +304,13 @@ func (s *Server) serverHeartbeat(ctx context.Context, c *client) {
 			return
 		case <-ticker.C:
 			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			c.writeMu.Lock()
 			err := c.Conn.Ping(pingCtx)
+			c.writeMu.Unlock()
 			cancel()
 			if err != nil {
 				s.log.Warn().Err(err).Str("uuid", c.UUID).Msg("client ping failed")
+				c.closed.Store(true)
 				c.Conn.Close(websocket.StatusNormalClosure, "ping timeout")
 				return
 			}
@@ -311,6 +322,7 @@ func (s *Server) readLoop(ctx context.Context, c *client) {
 	for {
 		msgType, data, err := c.Conn.Read(ctx)
 		if err != nil {
+			c.closed.Store(true)
 			s.log.Debug().Err(err).Str("uuid", c.UUID).Msg("read loop ended")
 			return
 		}
@@ -347,7 +359,7 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 	// Check overlay: is destination in our CIDR?
 	if s.overlayCIDR.Contains(dst.AsSlice()) {
 		s.mu.RLock()
-		conns := s.vipMap[dst]
+		conns := append([]*client(nil), s.vipMap[dst]...)
 		s.mu.RUnlock()
 
 		if len(conns) == 0 {
@@ -360,6 +372,13 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 
 		// Select connection with most available WriteCh space.
 		target := selectBest(conns)
+		if target == nil {
+			s.log.Debug().
+				Str("from", from.VirtualIP.String()).
+				Str("dst", dst.String()).
+				Msg("no open dst connection, dropping")
+			return
+		}
 
 		select {
 		case target.WriteCh <- raw:
@@ -402,9 +421,12 @@ func (s *Server) writeLoop(ctx context.Context, c *client) {
 				return
 			}
 			writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			c.writeMu.Lock()
 			err := c.Conn.Write(writeCtx, websocket.MessageBinary, data)
+			c.writeMu.Unlock()
 			cancel()
 			if err != nil {
+				c.closed.Store(true)
 				s.log.Debug().Err(err).Str("uuid", c.UUID).Msg("write failed")
 				return
 			}
