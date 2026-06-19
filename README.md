@@ -1,75 +1,75 @@
-# ws-vpn-go
+# wsvpn
 
-一个计划中的单二进制 WebSocket 三层 VPN / 组网项目。
+一个基于 WebSocket 的三层 VPN 组网工具，Go 单二进制实现。
 
-这个项目目前只初始化目录和设计文档，不包含 Go 代码。后续目标是构建一个 Go 二进制，运行时通过参数选择 `server` 或 `client` 模式：
+## 当前状态
 
-```text
-wsvpn server --config server.yaml
-wsvpn client --config client.yaml
+阶段 0-3 已完成：WebSocket relay、VIP 动态分配、Windows TUN 客户端。
+单机双客户端互 ping 验证通过（<1ms 延迟，0% 丢包）。
+
+## 快速开始
+
+### 构建
+
+```bash
+go build -o bin/wsvpn.exe ./cmd/wsvpn/
 ```
 
-## 核心想法
+Windows 需要 `wintun.dll` 放在 `bin/` 目录下。
 
-客户端创建 TUN 虚拟网卡，把系统路由导入 TUN。程序从 TUN 读取原始 IP 包，通过 WebSocket binary frame 发给服务端。服务端根据目标 IP 做两类转发：
+### 运行测试（需要管理员权限）
 
-```text
-1. Overlay 内网转发
-   Client A -> Server -> Client B
+```powershell
+# 终端 1：服务端
+.\bin\wsvpn.exe server -c testdata\server.yaml
 
-2. 服务端出口转发
-   Client A -> Server TUN -> Linux routing/NAT -> Internet
+# 终端 2：客户端 A
+.\bin\wsvpn.exe client -c testdata\client-a.yaml
+
+# 终端 3：客户端 B
+.\bin\wsvpn.exe client -c testdata\client-b.yaml
+
+# 终端 4：测试连通性
+ping -S 10.66.0.2 10.66.0.3
 ```
 
-它更接近一个中心化的 WebSocket L3 VPN，而不是普通 HTTP/SOCKS 代理。
+或使用测试脚本：
 
-## 目标
-
-- 单个 Go 二进制，同时支持服务端和客户端角色。
-- Go 代码不堆在仓库根目录。
-- 支持虚拟网段内客户端互通，例如 `10.66.0.0/24`。
-- 支持服务端作为出口网关，为客户端访问公网或真实内网。
-- 传输层先使用 WebSocket，便于穿透企业网络、反向代理和 `443` 端口部署。
-- 第一阶段优先实现可靠、可调试的 MVP，而不是追求极致性能。
-
-## 非目标
-
-- 第一版不做 Tailscale 级别的 NAT 穿透和 P2P 直连。
-- 第一版不做复杂 ACL 策略引擎。
-- 第一版不手写用户态 TCP/IP 栈。
-- 第一版不把 IP 包转换成 SOCKS/HTTP 代理请求。
-- 第一版不承诺高吞吐和低延迟场景。
-
-## 计划目录
-
-```text
-ws-vpn-go/
-  README.md
-  docs/
-    HANDOFF.md
-    ARCHITECTURE.md
-    ROADMAP.md
-    OPERATIONS.md
-  cmd/
-    wsvpn/
-      # 未来放 main 包入口
-  internal/
-    app/
-      # 未来放 server/client 启动编排
-    config/
-      # 未来放配置加载、校验、默认值
-    packet/
-      # 未来放 IPv4/IPv6 包头解析和基础校验
-    relay/
-      # 未来放 WebSocket relay、客户端表、路由分发
-    tun/
-      # 未来放跨平台 TUN 创建、读写、MTU 配置
+```powershell
+.\scripts\test-tun.ps1
 ```
 
-## 推荐阅读顺序
+## 架构
 
-1. [docs/HANDOFF.md](docs/HANDOFF.md)
-2. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-3. [docs/ROADMAP.md](docs/ROADMAP.md)
-4. [docs/OPERATIONS.md](docs/OPERATIONS.md)
+```text
+Client A TUN (10.66.0.2)
+    -> wsvpn client
+    -> WebSocket (30s heartbeat)
+    -> Server relay (VIP 分配 + 转发)
+    -> WebSocket
+    -> wsvpn client
+    -> Client B TUN (10.66.0.3)
+```
 
+## 项目结构
+
+```text
+cmd/wsvpn/          CLI 入口（cobra server/client 子命令）
+internal/
+  config/           YAML 配置解析
+  conn/             客户端连接、心跳、断线重连
+  logger/           彩色终端日志
+  packet/           IPv4 包头解析
+  relay/            服务端 relay、VIP 分配、转发
+  tun/              TUN 设备（wireguard-go）+ 平台 IP 配置
+bin/                构建产物（gitignored）
+testdata/           测试配置文件
+docs/               设计文档
+```
+
+## 设计文档
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 架构说明
+- [docs/ROADMAP.md](docs/ROADMAP.md) — 开发路线（含完成状态）
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — 配置和部署
+- [docs/HANDOFF.md](docs/HANDOFF.md) — 项目上下文和决策记录

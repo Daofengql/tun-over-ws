@@ -4,7 +4,7 @@
 *.dll
 *.so
 *.dylib
-wsvpn.exe
+bin/
 
 # Test binary
 *.test

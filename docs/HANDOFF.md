@@ -11,13 +11,17 @@
 
 ## 当前状态
 
-当前只完成了项目目录初始化和设计文档编写，没有 Go 代码。
+阶段 0-3 已完成，阶段 5 部分完成（心跳和重连）。代码可运行，Windows 客户端单机互 ping 验证通过。
 
-已经创建的目录：
+已实现：
 
-```text
-D:\Projects\ws-vpn-go
-```
+- IPv4 包头解析和校验（`internal/packet`）。
+- YAML 配置加载（`internal/config`）。
+- WebSocket relay 服务端，VIP 动态分配（`internal/relay`）。
+- 客户端 WebSocket 连接、心跳（30s）、断线重连（指数退避）（`internal/conn`）。
+- TUN 设备创建和 IP 配置（`internal/tun`，Windows 已验证）。
+- Cobra CLI 入口（`cmd/wsvpn`）。
+- 彩色终端日志（`internal/logger`，zerolog）。
 
 关键约束：
 

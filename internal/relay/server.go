@@ -18,6 +18,8 @@ import (
 	"github.com/daofeng/ws-vpn-go/internal/packet"
 )
 
+const pingInterval = 30 * time.Second
+
 // client represents a connected client.
 type client struct {
 	UUID       string
@@ -33,8 +35,10 @@ type Server struct {
 	allocator *VIPAllocator
 
 	mu      sync.RWMutex
-	clients map[string]*client // UUID -> client
-	vipMap  map[netip.Addr]*client // VIP -> client
+	clients map[string]*client      // UUID -> client
+	vipMap  map[netip.Addr]*client  // VIP -> client
+
+	overlayCIDR *net.IPNet // pre-parsed for fast matching
 
 	log zerolog.Logger
 }
@@ -51,12 +55,18 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("create vip allocator: %w", err)
 	}
 
+	_, cidr, err := net.ParseCIDR(cfg.OverlayCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("parse overlay cidr: %w", err)
+	}
+
 	return &Server{
-		cfg:       cfg,
-		allocator: alloc,
-		clients:   make(map[string]*client),
-		vipMap:    make(map[netip.Addr]*client),
-		log:       logger.Logger.With().Str("component", "relay").Logger(),
+		cfg:         cfg,
+		allocator:   alloc,
+		clients:     make(map[string]*client),
+		vipMap:      make(map[netip.Addr]*client),
+		overlayCIDR: cidr,
+		log:         logger.Logger.With().Str("component", "relay").Logger(),
 	}, nil
 }
 
@@ -133,7 +143,7 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 		UUID:       uuid,
 		VirtualIP:  vip,
 		Conn:       conn,
-		WriteCh:    make(chan []byte, 256),
+		WriteCh:    make(chan []byte, 512),
 		RemoteAddr: remoteAddr,
 	}
 	s.registerClient(c)
@@ -145,14 +155,20 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 		Str("remote", remoteAddr).
 		Msg("client connected")
 
-	// Step 5: Run read and write loops.
+	// Step 5: Run read, write, and heartbeat loops.
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
 	done := make(chan struct{})
+
 	go func() {
-		s.writeLoop(ctx, c)
+		s.writeLoop(connCtx, c)
 		close(done)
 	}()
 
-	s.readLoop(ctx, c)
+	go s.serverHeartbeat(connCtx, c)
+
+	s.readLoop(connCtx, c)
 	<-done
 }
 
@@ -214,7 +230,6 @@ func (s *Server) registerClient(c *client) {
 	if old, ok := s.clients[c.UUID]; ok {
 		s.log.Info().Str("uuid", c.UUID).Msg("replacing existing connection")
 		old.Conn.Close(websocket.StatusNormalClosure, "replaced by new connection")
-		// Drain old write channel
 		close(old.WriteCh)
 		delete(s.vipMap, old.VirtualIP)
 	}
@@ -230,11 +245,32 @@ func (s *Server) unregisterClient(uuid string) {
 	if c, ok := s.clients[uuid]; ok {
 		delete(s.clients, uuid)
 		delete(s.vipMap, c.VirtualIP)
-		// Don't release VIP - keep it bound to the UUID for reconnection.
 		s.log.Info().
 			Str("uuid", uuid).
 			Str("vip", c.VirtualIP.String()).
 			Msg("client disconnected")
+	}
+}
+
+// serverHeartbeat sends periodic pings to detect dead clients.
+func (s *Server) serverHeartbeat(ctx context.Context, c *client) {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := c.Conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				s.log.Warn().Err(err).Str("uuid", c.UUID).Msg("client ping failed")
+				c.Conn.Close(websocket.StatusNormalClosure, "ping timeout")
+				return
+			}
+		}
 	}
 }
 
@@ -247,12 +283,11 @@ func (s *Server) readLoop(ctx context.Context, c *client) {
 		}
 
 		if msgType == websocket.MessageText {
-			// Control message - ignore for now
 			s.log.Debug().Str("uuid", c.UUID).RawJSON("msg", data).Msg("control msg")
 			continue
 		}
 
-		// Binary: raw IP packet. Forward it.
+		// Binary: raw IP packet.
 		pkt, err := packet.ParseIPv4(data)
 		if err != nil {
 			s.log.Debug().Err(err).Str("uuid", c.UUID).Msg("invalid packet")
@@ -265,7 +300,7 @@ func (s *Server) readLoop(ctx context.Context, c *client) {
 				Str("uuid", c.UUID).
 				Str("expected", c.VirtualIP.String()).
 				Str("got", pkt.SrcAddr.String()).
-				Msg("source IP mismatch")
+				Msg("source IP spoofed, dropping")
 			continue
 		}
 
@@ -277,9 +312,7 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 	dst := pkt.DstAddr
 
 	// Check overlay: is destination in our CIDR?
-	_, cidr, _ := net.ParseCIDR(s.cfg.OverlayCIDR)
-	if cidr.Contains(dst.AsSlice()) {
-		// Overlay forward.
+	if s.overlayCIDR.Contains(dst.AsSlice()) {
 		s.mu.RLock()
 		target, ok := s.vipMap[dst]
 		s.mu.RUnlock()
@@ -288,7 +321,7 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 			s.log.Debug().
 				Str("from", from.VirtualIP.String()).
 				Str("dst", dst.String()).
-				Msg("overlay dst not found, dropping")
+				Msg("dst not found, dropping")
 			return
 		}
 
@@ -298,7 +331,7 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 				Str("from", from.VirtualIP.String()).
 				Str("dst", dst.String()).
 				Int("bytes", len(raw)).
-				Msg("overlay forwarded")
+				Msg("forwarded")
 		default:
 			s.log.Warn().
 				Str("dst", dst.String()).
@@ -316,7 +349,6 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 		return
 	}
 
-	// TODO: Write to server TUN when exit mode is implemented.
 	s.log.Debug().
 		Str("from", from.VirtualIP.String()).
 		Str("dst", dst.String()).
