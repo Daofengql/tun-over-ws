@@ -316,6 +316,7 @@ func (p *Pool) readConn(ctx context.Context, pc *pooledConn) {
 		if msgType == websocket.MessageText {
 			continue
 		}
+		pc.state.RecordRead(len(data))
 
 		pkt, err := packet.ParseIPv4(data)
 		if err != nil {
@@ -349,13 +350,14 @@ func (p *Pool) writeConn(ctx context.Context, pc *pooledConn) {
 			if !ok {
 				return
 			}
+			start := time.Now()
 			err := pc.write(ctx, data)
 			if err != nil {
 				p.log.Debug().Err(err).Msg("conn write failed")
 				pc.close()
 				return
 			}
-			pc.state.RecordBytes(len(data))
+			pc.state.RecordWrite(len(data), time.Since(start))
 		}
 	}
 }
@@ -594,7 +596,10 @@ func (p *Pool) queuePressure(pc *pooledConn) bool {
 	if pc == nil || cap(pc.writeCh) == 0 {
 		return false
 	}
-	return float64(len(pc.writeCh))/float64(cap(pc.writeCh)) >= queueHighWatermark
+	depth := len(pc.writeCh)
+	capacity := cap(pc.writeCh)
+	pc.state.RecordQueue(depth, capacity)
+	return float64(depth)/float64(capacity) >= queueHighWatermark
 }
 
 func (p *Pool) scheduleBuildLocked(ctx context.Context) {
@@ -749,6 +754,7 @@ func (p *Pool) stateUpdater(ctx context.Context) {
 		case <-ticker.C:
 			p.mu.RLock()
 			for _, pc := range p.conns {
+				pc.state.RecordQueue(len(pc.writeCh), cap(pc.writeCh))
 				pc.state.Update()
 			}
 			p.mu.RUnlock()

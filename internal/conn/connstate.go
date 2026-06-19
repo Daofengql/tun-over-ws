@@ -15,9 +15,11 @@ const (
 	warmupDuration      = 5 * time.Second
 
 	weightFloor = 0.1 // minimum weight for throttled connections
+
+	writeLatencyEWMAAlpha = 0.2
 )
 
-// ConnState tracks per-connection throughput, QoS health, and weight.
+// ConnState tracks per-connection throughput, lifecycle metrics, QoS health, and weight.
 type ConnState struct {
 	mu sync.Mutex
 
@@ -36,6 +38,16 @@ type ConnState struct {
 	// Weight for traffic distribution.
 	weight float64
 
+	// Lifecycle and diagnostics.
+	bytesWritten     int64
+	bytesRead        int64
+	lastWriteAt      time.Time
+	lastReadAt       time.Time
+	writeLatencyEWMA time.Duration
+	queueDepth       int
+	queueCapacity    int
+	queueFullSince   time.Time
+
 	// Timing.
 	createdAt time.Time
 }
@@ -52,9 +64,113 @@ func NewConnState() *ConnState {
 
 // RecordBytes records bytes written to this connection.
 func (cs *ConnState) RecordBytes(n int) {
+	cs.RecordWrite(n, 0)
+}
+
+// RecordWrite records a successful WebSocket write and its observed latency.
+func (cs *ConnState) RecordWrite(n int, latency time.Duration) {
 	cs.mu.Lock()
-	cs.bytesInBucket += int64(n)
-	cs.mu.Unlock()
+	defer cs.mu.Unlock()
+
+	now := time.Now()
+	if n > 0 {
+		cs.bytesInBucket += int64(n)
+		cs.bytesWritten += int64(n)
+	}
+	cs.lastWriteAt = now
+	if latency > 0 {
+		cs.writeLatencyEWMA = updateDurationEWMA(cs.writeLatencyEWMA, latency, writeLatencyEWMAAlpha)
+	}
+}
+
+// RecordRead records bytes received from the WebSocket.
+func (cs *ConnState) RecordRead(n int) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	if n > 0 {
+		cs.bytesRead += int64(n)
+	}
+	cs.lastReadAt = time.Now()
+}
+
+// RecordQueue records the latest write queue depth snapshot.
+func (cs *ConnState) RecordQueue(depth, capacity int) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	cs.queueDepth = depth
+	cs.queueCapacity = capacity
+	if capacity > 0 && depth >= capacity {
+		if cs.queueFullSince.IsZero() {
+			cs.queueFullSince = time.Now()
+		}
+	} else {
+		cs.queueFullSince = time.Time{}
+	}
+}
+
+// BytesWritten returns the total bytes successfully written to WebSocket.
+func (cs *ConnState) BytesWritten() int64 {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.bytesWritten
+}
+
+// BytesRead returns the total bytes read from WebSocket.
+func (cs *ConnState) BytesRead() int64 {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.bytesRead
+}
+
+// LastWriteAt returns the timestamp of the latest successful WebSocket write.
+func (cs *ConnState) LastWriteAt() time.Time {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.lastWriteAt
+}
+
+// LastReadAt returns the timestamp of the latest WebSocket read.
+func (cs *ConnState) LastReadAt() time.Time {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.lastReadAt
+}
+
+// WriteLatencyEWMA returns the smoothed WebSocket write latency.
+func (cs *ConnState) WriteLatencyEWMA() time.Duration {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.writeLatencyEWMA
+}
+
+// QueueDepth returns the last observed write queue depth.
+func (cs *ConnState) QueueDepth() int {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.queueDepth
+}
+
+// QueueCapacity returns the last observed write queue capacity.
+func (cs *ConnState) QueueCapacity() int {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.queueCapacity
+}
+
+// QueueFullSince returns when the write queue became full, if it is still full.
+func (cs *ConnState) QueueFullSince() time.Time {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.queueFullSince
+}
+
+func updateDurationEWMA(current, sample time.Duration, alpha float64) time.Duration {
+	if current <= 0 {
+		return sample
+	}
+	return time.Duration(float64(current)*(1-alpha) + float64(sample)*alpha)
 }
 
 // Update recalculates throughput, peak, weight, and QoS state.

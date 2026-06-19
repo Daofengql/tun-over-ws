@@ -4,7 +4,7 @@
 
 Phase 1-6 were implemented as an initial pool prototype. The current implementation has now changed the pool model from weighted multi-link dispatch plus token-bucket dropping to a fixed primary/standby WebSocket pool with backpressure-driven TCP pacing.
 
-Unit tests cover packet classification, client-side pool enqueue behavior, primary promotion, and server-side TCP/UDP enqueue behavior. Real cross-machine overlay validation is still pending for the revised design.
+Unit tests cover packet classification, client-side pool enqueue behavior, primary promotion, connection-state diagnostics, and server-side TCP/UDP enqueue behavior. Real cross-machine overlay validation is still pending for the revised design.
 
 ## Design Goal
 
@@ -299,7 +299,7 @@ Tasks:
 
 Explicit client-to-server role synchronization is not implemented yet. The server infers primary as the first alive connection for that VIP.
 
-### Phase E: Lifecycle and Metrics ✅ / partial
+### Phase E: Lifecycle and Metrics ✅
 
 Files:
 
@@ -310,27 +310,38 @@ Files:
 Tasks:
 
 - Queue pressure tracking is implemented for standby building.
-- Write latency EWMA is still pending.
+- Write latency EWMA is implemented as a diagnostic signal.
+- Per-connection read/write byte counters are implemented.
+- `lastReadAt` and `lastWriteAt` are implemented for lifecycle diagnostics.
+- Queue depth, queue capacity, and `queueFullSince` snapshots are implemented.
 - Keep heartbeat per connection.
 - Keep timeout rotation.
 - Log primary promotion, standby rebuild, degraded primary, UDP drops, and TCP waits.
 
-### Phase F: Tests ✅ / partial
+Current behavior:
+
+- Queue pressure can trigger standby building after sustained high-water samples.
+- Write latency EWMA is recorded around successful WebSocket writes.
+- Read/write counters and timestamps are observability signals only.
+- The pool does not yet rotate primary based on EWMA alone; that should be added only after local and cross-machine behavior is stable enough to define safe thresholds.
+
+### Phase F: Tests ✅ / local
 
 Tests to add or update:
 
-- TCP enqueue blocks instead of dropping when primary queue is full.
-- UDP uses standby when primary queue is full.
-- Primary failure promotes standby.
-- Standby rebuild scheduling respects `maxTotal`.
-- Primary rotation promotes standby and marks the old primary as draining.
-- Timeout rotation triggers planned promotion.
-- Server forwarding does not immediately drop TCP on full target queue.
-- Existing unit tests pass.
+- TCP enqueue blocks instead of dropping when primary queue is full. ✅
+- UDP uses standby when primary queue is full. ✅
+- Primary failure promotes standby. ✅
+- Standby rebuild scheduling respects `maxTotal`. ✅
+- Primary rotation promotes standby and marks the old primary as draining. ✅
+- Timeout rotation triggers planned promotion. ✅
+- Server forwarding does not immediately drop TCP on full target queue. ✅
+- Connection-state counters, timestamps, queue snapshots, and write latency EWMA are covered by unit tests. ✅
+- Existing unit tests pass. ✅
 
 Still pending:
 
-- Real Windows/Linux overlay ping tests for this revised pool.
+- Real Windows/Linux overlay ping tests for this revised pool. This is intentionally deferred and should not be run until explicitly requested.
 
 ## File Changes Summary
 

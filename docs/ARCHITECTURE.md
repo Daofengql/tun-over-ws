@@ -53,7 +53,7 @@ wsvpn client --config client.yaml
 - 连接服务端 WebSocket。
 - 从 TUN 读取 IPv4 包并发给服务端。
 - 从服务端接收 IPv4 包并写回 TUN。
-- 心跳（30s）和连接池管理（自动轮换、QoS 检测、拥塞控制）。
+- 心跳（30s）和连接池管理（自动轮换、QoS 检测、拥塞控制、连接状态指标）。
 
 客户端不负责：
 
@@ -74,7 +74,7 @@ wsvpn client --config client.yaml
 - 对 overlay 流量转发到目标客户端。
 - 对非 overlay 流量丢弃；未来 exit 模式会在这里写入 server TUN。
 - 记录连接、注册、转发、丢包原因。
-- 同一 UUID 支持多条连接（连接池），转发时按队列深度选路。
+- 同一 UUID 支持多条连接（连接池），转发时按 primary/standby 语义处理。
 
 服务端不应该在第一版里：
 
@@ -142,6 +142,10 @@ QoS 检测（`internal/conn/connstate.go`）：
 - 动态 peak 检测，新连接 5s 预热期。
 - 降级条件：peak > 1MB/s 且 current < peak × 50%。
 - 当前主要作为观测信号保留，不再参与按包加权随机调度。
+- 记录累计写出字节、累计读入字节、最后读写时间。
+- 记录 WebSocket 写延迟 EWMA，作为后续判断链路退化、调参和诊断的输入。
+- 记录写队列深度、容量和持续满队列起点，用于观察背压是否已经传导到 TUN 读取路径。
+- 当前不会仅因为单次写延迟或单次队列满就切换 primary。
 
 拥塞控制：
 
@@ -216,7 +220,7 @@ Client B 连接 -> 服务端分配 10.66.0.3
 registry[10.66.0.3] = [Client B conn1, Client B conn2, ...]
 ```
 
-服务端把原始 IP 包写入 Client B 队列最空闲的 WebSocket 连接。Client B 收到后写入 TUN，由 Client B 的操作系统网络栈处理。
+服务端把原始 IP 包按流量类型写入 Client B 的连接池。TCP 默认进入目标 VIP 的 primary 连接，队列满时等待以保留背压；UDP 可在 primary 满时尝试 standby，仍不可用则快速丢弃。Client B 收到后写入 TUN，由 Client B 的操作系统网络栈处理。
 
 回包路径相同：
 
@@ -300,6 +304,8 @@ NAT 10.66.0.0/24 out via eth0
 - overlay 转发包数相关日志。
 - WebSocket 心跳。
 - WebSocket 重连。
+- 每连接读写字节数、最后读写时间、写延迟 EWMA。
+- 每连接写队列深度、容量和持续满队列起点。
 
 建议后续增加：
 
