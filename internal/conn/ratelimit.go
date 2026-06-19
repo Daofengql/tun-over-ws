@@ -13,6 +13,10 @@ const (
 )
 
 // RateLimiter implements a token bucket for congestion control.
+//
+// Deprecated: the connection pool now uses TCP backpressure through bounded
+// queues. This type is kept temporarily for comparison and possible future
+// diagnostics, but it is not used in the hot path.
 type RateLimiter struct {
 	mu sync.Mutex
 

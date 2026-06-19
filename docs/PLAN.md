@@ -338,6 +338,7 @@ Still pending:
 |------|--------|
 | `internal/packet` | Add traffic classification helpers |
 | `internal/conn/pool.go` | Change weighted pool into primary/standby backpressure pool |
+| `internal/conn/client.go` | Keep the old `Conn` API as a thin wrapper over `Pool` |
 | `internal/conn/connstate.go` | Refocus metrics on lifecycle, queue, write latency |
 | `internal/conn/timeout.go` | Keep for planned rotation |
 | `internal/conn/ratelimit.go` | Deprecate or remove from hot path |
@@ -352,5 +353,5 @@ Still pending:
 - When the primary WebSocket is slow, TCP enqueue waits instead of dropping packets immediately.
 - UDP does not block TCP and can be dropped under pressure.
 - Client and server both avoid immediate TCP drop on full queues.
-- Existing Windows/Linux overlay ping still works.
+- Existing Windows/Linux overlay ping still works. This real network check is intentionally deferred for now.
 - No tracked config/testdata or remote connection information is added to the repo.
