@@ -50,7 +50,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 
 	logger.Logger.Info().
 		Str("vip", client.VirtualIP().String()).
-		Str("tun", "wsvpn0").
+		Str("tun", cfg.TUN.Name).
 		Msg("client ready")
 
 	// If --send-to is specified, send a test ICMP-like packet and exit.
