@@ -31,6 +31,8 @@ const (
 	icmpEnqueueWait      = 100 * time.Millisecond
 	queueHighWatermark   = 0.8
 	queuePressureSamples = 3
+	highWriteLatency     = 2 * time.Second
+	latencyHighSamples   = 3
 )
 
 type connRole string
@@ -75,6 +77,7 @@ type Pool struct {
 	pendingBuilds int
 	timeoutDetect *TimeoutDetector
 	pressureTicks int
+	latencyTicks  int
 
 	log zerolog.Logger
 }
@@ -594,6 +597,21 @@ func (p *Pool) monitorTick(ctx context.Context) {
 	if p.pressureTicks >= queuePressureSamples {
 		if primary := p.primaryLocked(); primary != nil {
 			p.log.Debug().Int("queue", len(primary.writeCh)).Msg("primary queue under pressure")
+			p.scheduleBuildLocked(ctx)
+		}
+	}
+
+	if primary := p.primaryLocked(); primary != nil && primary.state.WriteLatencyEWMA() >= highWriteLatency {
+		p.latencyTicks++
+	} else {
+		p.latencyTicks = 0
+	}
+	if p.latencyTicks >= latencyHighSamples {
+		if primary := p.primaryLocked(); primary != nil {
+			primary.state.MarkDegraded("write_latency")
+			p.log.Debug().
+				Dur("write_latency_ewma", primary.state.WriteLatencyEWMA()).
+				Msg("primary write latency high")
 			p.scheduleBuildLocked(ctx)
 		}
 	}

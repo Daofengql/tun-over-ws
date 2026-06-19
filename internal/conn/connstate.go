@@ -34,6 +34,7 @@ type ConnState struct {
 
 	// QoS.
 	throttled bool // permanent once set
+	degraded  bool // advisory lifecycle signal
 
 	// Weight for traffic distribution.
 	weight float64
@@ -47,6 +48,8 @@ type ConnState struct {
 	queueDepth       int
 	queueCapacity    int
 	queueFullSince   time.Time
+	degradedAt       time.Time
+	degradedReason   string
 
 	// Timing.
 	createdAt time.Time
@@ -164,6 +167,40 @@ func (cs *ConnState) QueueFullSince() time.Time {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return cs.queueFullSince
+}
+
+// MarkDegraded marks the connection as degraded for lifecycle diagnostics.
+func (cs *ConnState) MarkDegraded(reason string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	if cs.degraded {
+		return
+	}
+	cs.degraded = true
+	cs.degradedReason = reason
+	cs.degradedAt = time.Now()
+}
+
+// IsDegraded returns whether this connection has been marked degraded.
+func (cs *ConnState) IsDegraded() bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.degraded
+}
+
+// DegradedReason returns the reason the connection was marked degraded.
+func (cs *ConnState) DegradedReason() string {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.degradedReason
+}
+
+// DegradedAt returns when the connection was marked degraded.
+func (cs *ConnState) DegradedAt() time.Time {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.degradedAt
 }
 
 func updateDurationEWMA(current, sample time.Duration, alpha float64) time.Duration {

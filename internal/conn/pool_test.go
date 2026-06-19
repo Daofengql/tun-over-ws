@@ -183,3 +183,26 @@ func TestPoolMonitorRotatesPrimaryAtTimeoutThreshold(t *testing.T) {
 		t.Fatalf("old primary role: got %s want %s", primary.role, roleDraining)
 	}
 }
+
+func TestPoolMonitorBuildsStandbyOnSustainedWriteLatency(t *testing.T) {
+	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p.maxTotal = 3
+	primary := newTestPooledConn(rolePrimary, 1)
+	standby := newTestPooledConn(roleStandby, 1)
+	primary.state.RecordWrite(1, highWriteLatency)
+	p.conns = []*pooledConn{primary, standby}
+
+	for i := 0; i < latencyHighSamples-1; i++ {
+		p.pendingBuilds = 0
+		p.monitorTick(context.Background())
+	}
+	// Latency threshold not yet reached, no extra build from latency.
+	p.pendingBuilds = 0
+	p.monitorTick(context.Background())
+	if p.pendingBuilds != 1 {
+		t.Fatalf("pendingBuilds after sustained latency threshold: got %d want 1", p.pendingBuilds)
+	}
+	if !primary.state.IsDegraded() {
+		t.Fatal("primary should be degraded after sustained high latency")
+	}
+}
