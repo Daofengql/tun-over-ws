@@ -803,7 +803,7 @@ func (pc *pooledConn) tryEnqueue(data []byte) bool {
 	}
 	select {
 	case pc.writeCh <- data:
-		return pc.isAlive()
+		return true
 	case <-pc.done:
 		return false
 	default:
@@ -822,9 +822,6 @@ func (pc *pooledConn) enqueue(ctx context.Context, data []byte) (ok bool, closed
 	}
 	select {
 	case pc.writeCh <- data:
-		if !pc.isAlive() {
-			return false, true
-		}
 		return true, false
 	case <-pc.done:
 		return false, true
@@ -852,7 +849,7 @@ func (pc *pooledConn) enqueueWithTimeout(ctx context.Context, data []byte, timeo
 	}
 	select {
 	case pc.writeCh <- data:
-		return pc.isAlive()
+		return true
 	case <-pc.done:
 		return false
 	case <-ctx.Done():

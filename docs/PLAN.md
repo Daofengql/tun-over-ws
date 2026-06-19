@@ -295,7 +295,8 @@ Tasks:
 
 - Pick inferred primary for TCP forwarding. The first alive connection for a VIP is treated as primary.
 - Use blocking or longer-wait enqueue for TCP.
-- Wake TCP enqueue waits when the inferred primary closes, then retry selection so a standby can receive the packet.
+- Wake TCP enqueue waits when the inferred primary closes before queue acceptance, then retry selection so a standby can receive the packet.
+- Treat a packet accepted by a write queue as delivered to that WebSocket path; do not duplicate it to a standby if the connection closes after acceptance.
 - Keep UDP lossy and allow standby burst.
 
 Explicit client-to-server role synchronization is not implemented yet. The server infers primary as the first alive connection for that VIP.
@@ -338,6 +339,7 @@ Tests to add or update:
 - Timeout rotation triggers planned promotion. ✅
 - Server forwarding does not immediately drop TCP on full target queue. ✅
 - Server TCP forwarding retries a standby if the inferred primary closes while a sender is waiting. ✅
+- Queue acceptance is treated as successful enqueue to avoid duplicate packet injection during close races. ✅
 - Connection-state counters, timestamps, queue snapshots, and write latency EWMA are covered by unit tests. ✅
 - Existing unit tests pass. ✅
 

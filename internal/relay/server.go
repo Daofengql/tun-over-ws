@@ -448,7 +448,7 @@ func (s *Server) enqueueTCP(ctx context.Context, conns []*client, raw []byte) bo
 
 		select {
 		case target.WriteCh <- raw:
-			return !target.isClosed()
+			return true
 		case <-target.doneCh():
 			continue
 		case <-ctx.Done():
@@ -489,7 +489,7 @@ func (s *Server) enqueueUDP(ctx context.Context, conns []*client, raw []byte) bo
 	}
 	select {
 	case primary.WriteCh <- raw:
-		return !primary.isClosed()
+		return true
 	case <-primary.doneCh():
 		return false
 	case <-ctx.Done():
@@ -514,7 +514,7 @@ func (s *Server) enqueuePrimaryWithTimeout(ctx context.Context, conns []*client,
 
 		select {
 		case target.WriteCh <- raw:
-			return !target.isClosed()
+			return true
 		case <-target.doneCh():
 			continue
 		case <-ctx.Done():

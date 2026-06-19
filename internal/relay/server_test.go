@@ -283,3 +283,21 @@ func TestServerEnqueueTCPRetriesStandbyWhenPrimaryCloses(t *testing.T) {
 		t.Fatalf("standby packet: got %q want tcp", got)
 	}
 }
+
+func TestServerEnqueueTCPDoesNotDuplicateAfterQueueAccepts(t *testing.T) {
+	srv := &Server{}
+	primary := newTestRelayClient(1)
+	standby := newTestRelayClient(1)
+
+	if ok := srv.enqueueTCP(context.Background(), []*client{primary, standby}, []byte("tcp")); !ok {
+		t.Fatal("enqueueTCP returned false")
+	}
+	primary.markClosed()
+
+	if got := string(<-primary.WriteCh); got != "tcp" {
+		t.Fatalf("primary packet: got %q want tcp", got)
+	}
+	if len(standby.WriteCh) != 0 {
+		t.Fatalf("standby queue length: got %d want 0", len(standby.WriteCh))
+	}
+}

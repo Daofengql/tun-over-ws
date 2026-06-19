@@ -55,6 +55,20 @@ func TestPoolEnqueueTCPBlocksOnPrimary(t *testing.T) {
 	}
 }
 
+func TestPooledConnEnqueueSucceedsAfterQueueAccepts(t *testing.T) {
+	pc := newTestPooledConn(rolePrimary, 1)
+
+	ok, closed := pc.enqueue(context.Background(), []byte("tcp"))
+	if !ok || closed {
+		t.Fatalf("enqueue: ok=%v closed=%v, want ok=true closed=false", ok, closed)
+	}
+
+	pc.close()
+	if got := string(<-pc.writeCh); got != "tcp" {
+		t.Fatalf("queued packet: got %q want tcp", got)
+	}
+}
+
 func TestPoolEnqueueUDPUsesStandbyWhenPrimaryFull(t *testing.T) {
 	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
 	primary := newTestPooledConn(rolePrimary, 1)
