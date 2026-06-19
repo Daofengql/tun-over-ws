@@ -11,8 +11,8 @@ func TestParseIPv4(t *testing.T) {
 	pkt := make([]byte, 28)
 	pkt[0] = 0x45 // version=4, IHL=5
 	binary.BigEndian.PutUint16(pkt[2:4], 28)
-	pkt[8] = 64  // TTL
-	pkt[9] = 6   // TCP
+	pkt[8] = 64 // TTL
+	pkt[9] = 6  // TCP
 	s4 := netip.MustParseAddr("10.66.0.2").As4()
 	d4 := netip.MustParseAddr("10.66.0.3").As4()
 	copy(pkt[12:16], s4[:])
@@ -49,5 +49,24 @@ func TestParseIPv4_NotIPv4(t *testing.T) {
 	_, err := ParseIPv4(pkt)
 	if err == nil {
 		t.Fatal("expected error for IPv6")
+	}
+}
+
+func TestParseIPv4_TotalLengthZero(t *testing.T) {
+	pkt := make([]byte, 20)
+	pkt[0] = 0x45
+	_, err := ParseIPv4(pkt)
+	if err == nil {
+		t.Fatal("expected error for zero total length")
+	}
+}
+
+func TestParseIPv4_TotalLengthShorterThanHeader(t *testing.T) {
+	pkt := make([]byte, 20)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], 19)
+	_, err := ParseIPv4(pkt)
+	if err == nil {
+		t.Fatal("expected error for total length shorter than header")
 	}
 }

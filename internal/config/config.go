@@ -62,11 +62,11 @@ func (h *HeartbeatConf) UnmarshalYAML(value *yaml.Node) error {
 
 // ClientConfig is the client configuration.
 type ClientConfig struct {
-	ServerURL string        `yaml:"server_url"`
-	UUID      string        `yaml:"uuid"`
-	Token     string        `yaml:"token"`
-	TUN       TUNConfig     `yaml:"tun"`
-	Routes    RoutesConfig  `yaml:"routes"`
+	ServerURL string       `yaml:"server_url"`
+	UUID      string       `yaml:"uuid"`
+	Token     string       `yaml:"token"`
+	TUN       TUNConfig    `yaml:"tun"`
+	Routes    RoutesConfig `yaml:"routes"`
 }
 
 // RoutesConfig is client routing configuration.
@@ -147,9 +147,22 @@ func (c *ServerConfig) Validate() error {
 	if c.Listen == "" {
 		return fmt.Errorf("listen address is required")
 	}
-	_, err := netip.ParsePrefix(c.OverlayCIDR)
+	prefix, err := netip.ParsePrefix(c.OverlayCIDR)
 	if err != nil {
 		return fmt.Errorf("invalid overlay_cidr %q: %w", c.OverlayCIDR, err)
+	}
+	if !prefix.Addr().Is4() {
+		return fmt.Errorf("overlay_cidr must be IPv4, got %q", c.OverlayCIDR)
+	}
+	serverIP, err := netip.ParseAddr(c.ServerTUN.IP)
+	if err != nil {
+		return fmt.Errorf("invalid server_tun.ip %q: %w", c.ServerTUN.IP, err)
+	}
+	if !serverIP.Is4() {
+		return fmt.Errorf("server_tun.ip must be IPv4, got %q", c.ServerTUN.IP)
+	}
+	if !prefix.Contains(serverIP) {
+		return fmt.Errorf("server_tun.ip %q must be inside overlay_cidr %q", c.ServerTUN.IP, c.OverlayCIDR)
 	}
 	if len(c.Auth.Tokens) == 0 {
 		return fmt.Errorf("at least one auth token is required")

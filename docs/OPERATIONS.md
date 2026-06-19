@@ -1,29 +1,264 @@
-# 运行和部署设想
+# 运行和部署手册
 
 ## 平台支持
 
 ### 服务端
 
-仅支持 Linux。
+服务端目标平台是 Linux。
 
-原因：
-
-- TUN 支持成熟。
-- IP forwarding、conntrack、iptables/nftables 方案清晰。
-- 适合部署在 VPS、云主机或内网网关。
+当前服务端 relay 本身只需要监听 WebSocket，不创建 server TUN；未来 exit gateway 会依赖 Linux 内核 TUN、IP forwarding、conntrack 和 NAT。
 
 ### 客户端
 
-支持 Windows 和 Linux：
+客户端当前支持 Windows 和 Linux：
 
-- Windows：使用 Wintun 驱动（通过 `golang.zx2c4.com/wireguard/tun` 自动管理）。
-- Linux：使用 `/dev/net/tun`（同上库封装）。
+- Windows：使用 Wintun 驱动，通过 `golang.zx2c4.com/wireguard/tun` 创建 TUN，使用 `netsh` 配置 IP。
+- Linux：使用 `/dev/net/tun`，通过 `ip addr` 和 `ip link` 配置接口。
 
-第一版同时覆盖两个平台的客户端。
+当前只配置 overlay connected route，不接管默认路由。
 
-## 服务端出口配置示例
+## 构建
 
-以下是未来文档可参考的 Linux 配置思路，不代表当前项目已有代码。
+Windows：
+
+```powershell
+go build -o .\bin\wsvpn.exe .\cmd\wsvpn
+```
+
+Linux amd64：
+
+```powershell
+$env:GOOS = "linux"
+$env:GOARCH = "amd64"
+go build -o .\bin\wsvpn-linux-amd64 .\cmd\wsvpn
+Remove-Item Env:\GOOS
+Remove-Item Env:\GOARCH
+```
+
+验证：
+
+```powershell
+go test ./...
+go vet ./...
+```
+
+Windows 客户端运行前确认：
+
+- 管理员 PowerShell。
+- `bin\wsvpn.exe` 存在。
+- `bin\wintun.dll` 存在。
+
+Linux 客户端运行前确认：
+
+- root 权限。
+- `/dev/net/tun` 存在。
+- `ip` 命令可用。
+
+## 配置说明
+
+服务端开发配置：
+
+```yaml
+listen: ":18443"
+overlay_cidr: "10.66.0.0/24"
+server_tun:
+  enabled: false
+  name: "wsvpn0"
+  ip: "10.66.0.1"
+  mtu: 1280
+exit:
+  enabled: false
+auth:
+  tokens:
+    - "test-token-aaa"
+    - "test-token-bbb"
+heartbeat:
+  interval: 30s
+```
+
+客户端开发配置：
+
+```yaml
+server_url: "ws://127.0.0.1:18443/tunnel"
+uuid: "client-a-00000000-0000-0000-0000-000000000001"
+token: "test-token-aaa"
+tun:
+  name: "wsvpn0"
+  mtu: 1280
+routes:
+  exit:
+    enabled: false
+```
+
+注意：
+
+- 客户端不配置 `virtual_ip`，连接后由服务端分配。
+- 服务端会跳过 `server_tun.ip`，默认第一个客户端拿到 `10.66.0.2`。
+- `server_tun.enabled` 当前不影响 overlay relay；exit 还未实现。
+- UUID/token 是开发测试字段，后续会替换为签名登录机制。
+
+## 本地 Windows overlay 测试
+
+需要管理员 PowerShell。
+
+```powershell
+# 终端 1：服务端
+.\bin\wsvpn.exe server -c .\testdata\server.yaml --log-level debug
+
+# 终端 2：客户端 A
+.\bin\wsvpn.exe client -c .\testdata\client-a.yaml --log-level debug
+
+# 终端 3：客户端 B
+.\bin\wsvpn.exe client -c .\testdata\client-b.yaml --log-level debug
+
+# 终端 4：指定源地址 ping
+ping -S 10.66.0.2 10.66.0.3
+```
+
+预期：
+
+- 客户端 A 日志出现 `virtual_ip=10.66.0.2`。
+- 客户端 B 日志出现 `virtual_ip=10.66.0.3`。
+- 服务端日志出现 `forwarded`。
+- ping 有回复，0% 丢包。
+
+脚本方式：
+
+```powershell
+.\scripts\test-tun.ps1
+```
+
+## 远程 Windows/Linux overlay 测试
+
+已验证拓扑：
+
+```text
+server: 47.250.198.120:27000
+linux client: 10.66.0.2
+windows client: 10.66.0.3
+overlay: 10.66.0.0/24
+```
+
+远程服务端配置示例：
+
+```yaml
+listen: ":27000"
+overlay_cidr: "10.66.0.0/24"
+server_tun:
+  enabled: false
+  name: "wsvpn0"
+  ip: "10.66.0.1"
+  mtu: 1280
+exit:
+  enabled: false
+auth:
+  tokens:
+    - "test-token-linux"
+    - "test-token-win"
+heartbeat:
+  interval: 30s
+```
+
+远程 Linux 客户端配置示例：
+
+```yaml
+server_url: "ws://127.0.0.1:27000/tunnel"
+uuid: "linux-client-00000000-0000-0000-0000-000000000001"
+token: "test-token-linux"
+tun:
+  name: "wsvpn0"
+  mtu: 1280
+routes:
+  exit:
+    enabled: false
+```
+
+远程 Linux 启动：
+
+```bash
+./wsvpn-linux-amd64 server -c server.yaml --log-level debug
+./wsvpn-linux-amd64 client -c client-linux.yaml --log-level debug
+```
+
+Windows 启动：
+
+```powershell
+.\bin\wsvpn.exe client -c .\testdata\client-windows-remote.yaml --log-level debug
+```
+
+Linux 指定源接口测试：
+
+```bash
+ping -I 10.66.0.2 -c 4 -W 2 10.66.0.3
+```
+
+Windows 指定源地址测试：
+
+```powershell
+ping -S 10.66.0.3 10.66.0.2
+```
+
+不要修改 Linux 或 Windows 默认路由。当前测试只要求 overlay connected route 生效。
+
+## 停止远端测试进程
+
+远程测试时如果使用后台进程，可用这些命令收尾：
+
+```bash
+pkill -f 'wsvpn.*server'
+pkill -f 'wsvpn.*client'
+ip link show wsvpn0
+```
+
+如果接口还残留：
+
+```bash
+ip addr del 10.66.0.2/24 dev wsvpn0 2>/dev/null || true
+ip link set dev wsvpn0 down 2>/dev/null || true
+```
+
+## 日志判断
+
+客户端成功连接：
+
+```text
+registered with server virtual_ip=10.66.0.x overlay_cidr=10.66.0.0/24
+tun device created
+tun configured
+client ready
+```
+
+客户端发包：
+
+```text
+tun -> ws src=10.66.0.x dst=10.66.0.y
+```
+
+服务端转发：
+
+```text
+forwarded from=10.66.0.x dst=10.66.0.y
+```
+
+客户端收包：
+
+```text
+ws -> tun src=10.66.0.x dst=10.66.0.y
+```
+
+常见 debug 噪音：
+
+- `not an IPv4 packet: version 6`：系统把 IPv6 包送进 TUN，当前 MVP 不支持 IPv6，会丢弃。
+- `dst not found, dropping`：目标 VIP 不在线，或者 VIP 分配和测试命令不一致。
+- `exit disabled, dropping`：目标不在 overlay 内，当前没有 exit gateway。
+
+已修复过的关键问题：
+
+- Linux `tun write failed: invalid offset`：wireguard-go Linux TUN 后端需要读写 buffer headroom；当前 `internal/tun/tun.go` 使用 `tunPacketOffset = 16`。
+
+## 未来服务端出口配置示例
+
+以下是未来 exit gateway 的 Linux 配置思路，不代表当前项目已有完整代码。
 
 开启 IPv4 转发：
 
@@ -39,12 +274,12 @@ iptables -t nat -A POSTROUTING -s 10.66.0.0/24 -o eth0 -j MASQUERADE
 
 如果使用 nftables，后续可提供等价配置。
 
-## 客户端路由示例
+## 未来客户端 exit 路由示例
 
-仅 overlay（默认，VIP 分配后自动配置）：
+仅 overlay（当前默认）：
 
 ```sh
-ip route add <assigned_overlay_cidr> dev wsvpn0
+ip route add 10.66.0.0/24 dev wsvpn0
 ```
 
 启用 exit：
@@ -83,58 +318,17 @@ tls: required in production
 ipv6: disabled in MVP
 ```
 
-## 配置草案
-
-服务端：
-
-```yaml
-listen: ":8443"
-overlay_cidr: "10.66.0.0/24"
-server_tun:
-  enabled: true
-  name: "wsvpn0"
-  ip: "10.66.0.1"
-  mtu: 1280
-exit:
-  enabled: true
-auth:
-  tokens:
-    - "replace-me"
-    - "replace-me-too"
-heartbeat:
-  interval: 30s
-```
-
-客户端：
-
-```yaml
-server_url: "ws://vpn.example.com/tunnel"
-uuid: "550e8400-e29b-41d4-a716-446655440000"
-token: "replace-me"
-tun:
-  name: "wsvpn0"
-  mtu: 1280
-routes:
-  exit:
-    enabled: false
-```
-
-注意：
-
-- 客户端不再配置 `virtual_ip`，连接后由服务端分配。
-- 客户端 `uuid` 来源于登录系统，本地持久化，全局唯一。
-- 服务端不再逐节点绑定 IP，改为动态分配池。
-
-## 调试建议
+## 诊断建议
 
 常用检查：
 
 - 客户端 TUN 是否创建成功。
 - 客户端虚拟 IP 是否配置成功。
-- 客户端路由表是否正确。
+- 客户端路由表是否有 overlay connected route。
 - WebSocket 是否连接成功。
 - 服务端是否注册了正确的虚拟 IP。
 - 服务端是否因为目标 IP 未命中而丢包。
+- 服务端是否因为 source IP 不等于 VIP 而丢包。
 - 服务端出口模式下 `ip_forward` 是否开启。
 - NAT 规则是否命中。
 

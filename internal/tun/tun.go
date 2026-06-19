@@ -9,6 +9,10 @@ import (
 // DefaultMTU is the default MTU for TUN devices.
 const DefaultMTU = 1280
 
+// tunPacketOffset leaves headroom expected by wireguard-go's TUN backends.
+// Linux may enable virtio-net headers internally and rejects offset 0 writes.
+const tunPacketOffset = 16
+
 // Device wraps a wireguard-go TUN device with IP configuration.
 type Device struct {
 	dev  tun.Device
@@ -36,22 +40,27 @@ func (d *Device) Name() string { return d.name }
 
 // Read reads a packet from the TUN. Returns raw IPv4 bytes (family prefix stripped).
 func (d *Device) Read(buf []byte) (int, error) {
-	bufs := [][]byte{buf}
+	readBuf := make([]byte, len(buf)+tunPacketOffset)
+	bufs := [][]byte{readBuf}
 	sizes := []int{0}
-	n, err := d.dev.Read(bufs, sizes, 0)
+	n, err := d.dev.Read(bufs, sizes, tunPacketOffset)
 	if err != nil {
 		return 0, err
 	}
 	if n == 0 {
 		return 0, nil
 	}
+	copy(buf, readBuf[tunPacketOffset:tunPacketOffset+sizes[0]])
 	return sizes[0], nil
 }
 
 // Write writes a raw IPv4 packet to the TUN (family prefix prepended internally).
 func (d *Device) Write(buf []byte) (int, error) {
-	bufs := [][]byte{buf}
-	_, err := d.dev.Write(bufs, 0)
+	writeBuf := make([]byte, len(buf)+tunPacketOffset)
+	copy(writeBuf[tunPacketOffset:], buf)
+
+	bufs := [][]byte{writeBuf}
+	_, err := d.dev.Write(bufs, tunPacketOffset)
 	if err != nil {
 		return 0, err
 	}

@@ -35,8 +35,8 @@ type Server struct {
 	allocator *VIPAllocator
 
 	mu      sync.RWMutex
-	clients map[string]*client      // UUID -> client
-	vipMap  map[netip.Addr]*client  // VIP -> client
+	clients map[string]*client     // UUID -> client
+	vipMap  map[netip.Addr]*client // VIP -> client
 
 	overlayCIDR *net.IPNet // pre-parsed for fast matching
 
@@ -73,7 +73,9 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 // ListenAndServe starts the HTTP server and listens for WebSocket connections.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/tunnel", s.handleTunnel)
+	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
+		s.handleTunnel(ctx, w, r)
+	})
 
 	server := &http.Server{
 		Addr:    s.cfg.Listen,
@@ -94,7 +96,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTunnel(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	remoteAddr := r.RemoteAddr
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		remoteAddr = xff
@@ -108,7 +110,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go s.handleConn(context.Background(), conn, remoteAddr)
+	go s.handleConn(ctx, conn, remoteAddr)
 }
 
 func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAddr string) {
@@ -147,7 +149,7 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 		RemoteAddr: remoteAddr,
 	}
 	s.registerClient(c)
-	defer s.unregisterClient(uuid)
+	defer s.unregisterClient(c)
 
 	s.log.Info().
 		Str("uuid", uuid).
@@ -162,13 +164,18 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 	done := make(chan struct{})
 
 	go func() {
+		defer connCancel()
+		defer close(done)
 		s.writeLoop(connCtx, c)
-		close(done)
 	}()
 
-	go s.serverHeartbeat(connCtx, c)
+	go func() {
+		defer connCancel()
+		s.serverHeartbeat(connCtx, c)
+	}()
 
 	s.readLoop(connCtx, c)
+	connCancel()
 	<-done
 }
 
@@ -230,7 +237,6 @@ func (s *Server) registerClient(c *client) {
 	if old, ok := s.clients[c.UUID]; ok {
 		s.log.Info().Str("uuid", c.UUID).Msg("replacing existing connection")
 		old.Conn.Close(websocket.StatusNormalClosure, "replaced by new connection")
-		close(old.WriteCh)
 		delete(s.vipMap, old.VirtualIP)
 	}
 
@@ -238,15 +244,16 @@ func (s *Server) registerClient(c *client) {
 	s.vipMap[c.VirtualIP] = c
 }
 
-func (s *Server) unregisterClient(uuid string) {
+func (s *Server) unregisterClient(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if c, ok := s.clients[uuid]; ok {
-		delete(s.clients, uuid)
+	current, ok := s.clients[c.UUID]
+	if ok && current == c {
+		delete(s.clients, c.UUID)
 		delete(s.vipMap, c.VirtualIP)
 		s.log.Info().
-			Str("uuid", uuid).
+			Str("uuid", c.UUID).
 			Str("vip", c.VirtualIP.String()).
 			Msg("client disconnected")
 	}

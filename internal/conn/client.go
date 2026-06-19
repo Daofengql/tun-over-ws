@@ -180,9 +180,7 @@ func (c *Conn) connLoop(ctx context.Context) {
 	delay := reconnectBaseDelay
 
 	for {
-		// If not first connection, reconnect.
-		if c.wsConn != nil {
-			c.closeWS()
+		if c.wsConn == nil {
 			c.log.Warn().Dur("delay", delay).Msg("reconnecting...")
 			select {
 			case <-ctx.Done():
@@ -205,6 +203,7 @@ func (c *Conn) connLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		c.closeWS()
 		// Connection lost, loop will reconnect.
 	}
 }

@@ -25,11 +25,12 @@ if (-not $isAdmin) {
 
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 if (-not $ProjectDir) { $ProjectDir = $PSScriptRoot }
-$Exe = Join-Path $ProjectDir "wsvpn.exe"
+$BinDir = Join-Path $ProjectDir "bin"
+$Exe = Join-Path $BinDir "wsvpn.exe"
 $ServerCfg = Join-Path $ProjectDir "testdata\server.yaml"
 $ClientACfg = Join-Path $ProjectDir "testdata\client-a.yaml"
 $ClientBCfg = Join-Path $ProjectDir "testdata\client-b.yaml"
-$WintunDll = Join-Path $ProjectDir "wintun.dll"
+$WintunDll = Join-Path $BinDir "wintun.dll"
 
 # Verify files exist
 foreach ($f in @($Exe, $ServerCfg, $ClientACfg, $ClientBCfg, $WintunDll)) {
