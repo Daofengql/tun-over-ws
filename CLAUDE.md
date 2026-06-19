@@ -48,7 +48,7 @@ ping -S 10.66.0.2 10.66.0.3
 - `internal/packet/` - IPv4 header parsing and validation
 - `internal/config/` - YAML config loading and validation
 - `internal/relay/` - Server-side WebSocket relay, VIP allocator, source validation, forwarding
-- `internal/conn/` - Client-side WebSocket connection, heartbeat, reconnection, TUN pump
+- `internal/conn/` - Client-side connection pool, QoS detection, congestion control, TUN pump
 - `internal/tun/` - TUN device wrapper (wireguard-go), platform-specific IP setup
 - `internal/logger/` - Colored terminal logger (zerolog)
 
@@ -58,6 +58,7 @@ ping -S 10.66.0.2 10.66.0.3
 - Client: Windows + Linux.
 - VIP allocation: server-issued (DHCP-like), client identified by UUID.
 - WebSocket: `github.com/coder/websocket`, with 30s heartbeat ping and auto-reconnect.
+- Connection pool: multi-conn per UUID, weighted routing, QoS detection, congestion control.
 - TUN: `golang.zx2c4.com/wireguard/tun`.
 - Windows requires `wintun.dll` next to the binary.
 - Linux TUN read/write uses 16-byte packet offset/headroom.

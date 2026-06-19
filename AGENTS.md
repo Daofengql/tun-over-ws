@@ -17,7 +17,7 @@ tun-over-ws/
     client.go           # Client subcommand
   internal/
     config/             # YAML config parsing and validation
-    conn/               # Client WS connection, heartbeat, reconnect, TUN pump
+    conn/               # Client connection pool, QoS detection, congestion control, TUN pump
     logger/             # Colored zerolog setup
     packet/             # IPv4 packet parsing
     relay/              # Server relay, VIP allocator, forwarding, source validation
@@ -43,7 +43,7 @@ tun-over-ws/
 - Phase 0-2 complete: config, packet parsing, WebSocket relay, VIP allocation.
 - Phase 3 complete: Windows and Linux TUN clients, overlay relay verified with ping.
 - Phase 4 (exit mode): not started.
-- Phase 5 (stability): heartbeat (30s), auto-reconnect with exponential backoff, source VIP validation, connection replacement.
+- Phase 5 (stability): heartbeat (30s), auto-reconnect with exponential backoff, source VIP validation, connection replacement, connection pool with weighted routing.
 - Phase 6 (security): only test token auth and source VIP validation exist. ACL and signed login are not implemented.
 
 Verified scenarios:
