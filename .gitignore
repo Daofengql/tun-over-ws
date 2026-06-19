@@ -4,7 +4,7 @@
 *.dll
 *.so
 *.dylib
-wsvpn
+wsvpn.exe
 
 # Test binary
 *.test
@@ -25,6 +25,9 @@ go.work.sum
 # OS
 .DS_Store
 Thumbs.db
+
+# Wintun DLL (downloaded separately)
+wintun.dll
 
 # Dependency directories
 vendor/

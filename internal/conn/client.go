@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/daofeng/ws-vpn-go/internal/logger"
 	"github.com/daofeng/ws-vpn-go/internal/packet"
+	"github.com/daofeng/ws-vpn-go/internal/tun"
 )
 
 // HelloMessage is the initial client registration message.
@@ -32,61 +35,70 @@ type HelloOK struct {
 	Routes      []string `json:"routes"`
 }
 
-// PacketCallback is called when a relay packet is received.
-type PacketCallback func(src, dst netip.Addr, data []byte)
-
-// Conn manages a client-side WebSocket connection.
+// Conn manages a client-side WebSocket connection with TUN device.
 type Conn struct {
 	uuid      string
 	token     string
 	serverURL string
-	mtu       int
+	tunName   string
 
 	conn      *websocket.Conn
+	tunDev    *tun.Device
 	virtualIP netip.Addr
-	onPacket  PacketCallback
 	writeCh   chan []byte
 	log       zerolog.Logger
 }
 
 // New creates a new client connection.
-func New(serverURL, uuid, token string, mtu int, onPacket PacketCallback) *Conn {
+func New(serverURL, uuid, token, tunName string) *Conn {
+	if tunName == "" {
+		tunName = "wsvpn0"
+	}
 	return &Conn{
 		uuid:      uuid,
 		token:     token,
 		serverURL: serverURL,
-		mtu:       mtu,
-		onPacket:  onPacket,
+		tunName:   tunName,
 		writeCh:   make(chan []byte, 256),
 		log:       logger.Logger.With().Str("component", "client").Logger(),
 	}
 }
 
-// Connect establishes the WebSocket connection and performs the hello handshake.
+// Connect establishes the WebSocket connection, performs the hello handshake,
+// creates a TUN device, and configures its IP.
 func (c *Conn) Connect(ctx context.Context) error {
+	// 1. Connect WebSocket.
 	c.log.Info().Str("url", c.serverURL).Msg("connecting to server")
-
 	conn, _, err := websocket.Dial(ctx, c.serverURL, nil)
 	if err != nil {
 		return fmt.Errorf("websocket dial: %w", err)
 	}
 	c.conn = conn
 
+	// 2. Hello handshake.
 	if err := c.hello(ctx); err != nil {
 		conn.CloseNow()
 		return err
 	}
 
+	// 3. Create TUN device.
+	dev, err := tun.Create(c.tunName, 1280)
+	if err != nil {
+		conn.CloseNow()
+		return fmt.Errorf("create tun: %w", err)
+	}
+	c.tunDev = dev
+	c.log.Info().Str("tun", dev.Name()).Msg("tun device created")
+
+	// 4. Configure TUN IP.
+	if err := dev.SetupIP(c.virtualIP.String()); err != nil {
+		dev.Close()
+		conn.CloseNow()
+		return fmt.Errorf("setup tun ip: %w", err)
+	}
+	c.log.Info().Str("ip", c.virtualIP.String()).Str("tun", dev.Name()).Msg("tun configured")
+
 	return nil
-}
-
-// Run starts the read and write loops. Blocks until context is cancelled or error.
-func (c *Conn) Run(ctx context.Context) error {
-	defer c.conn.CloseNow()
-
-	go c.writeLoop(ctx)
-
-	return c.readLoop(ctx)
 }
 
 // VirtualIP returns the allocated virtual IP.
@@ -94,13 +106,51 @@ func (c *Conn) VirtualIP() netip.Addr {
 	return c.virtualIP
 }
 
-// Send queues a packet for sending.
-func (c *Conn) Send(data []byte) {
-	select {
-	case c.writeCh <- data:
-	default:
-		c.log.Warn().Msg("write channel full, dropping packet")
+// Run starts the TUN <-> WebSocket pump. Blocks until context is cancelled or error.
+func (c *Conn) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// TUN -> WebSocket
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.tunToWS(ctx)
+	}()
+
+	// WebSocket -> TUN
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.wsToTUN(ctx)
+	}()
+
+	// WebSocket write loop (drains writeCh)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.writeLoop(ctx)
+	}()
+
+	// Wait for context cancellation.
+	<-ctx.Done()
+
+	// Cleanup: close TUN first (unblocks tunToWS read), then close WebSocket.
+	if c.tunDev != nil {
+		c.tunDev.CleanupIP(c.virtualIP.String())
+		c.tunDev.Close()
 	}
+	if c.conn != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer closeCancel()
+		c.conn.Close(websocket.StatusNormalClosure, "client shutdown")
+		_ = closeCtx
+	}
+
+	wg.Wait()
+	return nil
 }
 
 func (c *Conn) hello(ctx context.Context) error {
@@ -149,28 +199,80 @@ func (c *Conn) hello(ctx context.Context) error {
 	return nil
 }
 
-func (c *Conn) readLoop(ctx context.Context) error {
+// tunToWS reads packets from TUN and sends them to the server via WebSocket.
+func (c *Conn) tunToWS(ctx context.Context) {
+	buf := make([]byte, 1500)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		n, err := c.tunDev.Read(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			c.log.Debug().Err(err).Msg("tun read error")
+			continue
+		}
+		if n == 0 {
+			continue
+		}
+
+		raw := make([]byte, n)
+		copy(raw, buf[:n])
+
+		// Log for debugging.
+		pkt, err := packet.ParseIPv4(raw)
+		if err != nil {
+			c.log.Debug().Err(err).Msg("tun: invalid packet")
+			continue
+		}
+		c.log.Debug().
+			Str("src", pkt.SrcAddr.String()).
+			Str("dst", pkt.DstAddr.String()).
+			Int("bytes", n).
+			Msg("tun -> ws")
+
+		c.writeCh <- raw
+	}
+}
+
+// wsToTUN reads relay packets from the server and writes them to TUN.
+func (c *Conn) wsToTUN(ctx context.Context) {
 	for {
 		msgType, data, err := c.conn.Read(ctx)
 		if err != nil {
-			return fmt.Errorf("read: %w", err)
+			if ctx.Err() != nil {
+				return
+			}
+			c.log.Error().Err(err).Msg("ws read error")
+			return
 		}
 
 		if msgType == websocket.MessageText {
-			// Control message from server (e.g. heartbeat ack)
 			c.log.Debug().RawJSON("msg", data).Msg("control message")
 			continue
 		}
 
-		// Binary: raw IP packet
+		// Binary: relay packet from server.
 		pkt, err := packet.ParseIPv4(data)
 		if err != nil {
-			c.log.Debug().Err(err).Msg("invalid packet from server")
+			c.log.Debug().Err(err).Msg("ws: invalid packet")
 			continue
 		}
 
-		if c.onPacket != nil {
-			c.onPacket(pkt.SrcAddr, pkt.DstAddr, data)
+		c.log.Info().
+			Str("src", pkt.SrcAddr.String()).
+			Str("dst", pkt.DstAddr.String()).
+			Int("bytes", len(data)).
+			Msg("ws -> tun")
+
+		_, err = c.tunDev.Write(data)
+		if err != nil {
+			c.log.Error().Err(err).Msg("tun write error")
 		}
 	}
 }
@@ -185,7 +287,7 @@ func (c *Conn) writeLoop(ctx context.Context) {
 			err := c.conn.Write(writeCtx, websocket.MessageBinary, data)
 			cancel()
 			if err != nil {
-				c.log.Error().Err(err).Msg("write failed")
+				c.log.Error().Err(err).Msg("ws write error")
 				return
 			}
 		}
@@ -193,6 +295,6 @@ func (c *Conn) writeLoop(ctx context.Context) {
 }
 
 func hostname() string {
-	h, _ := getHostname()
+	h, _ := os.Hostname()
 	return h
 }
