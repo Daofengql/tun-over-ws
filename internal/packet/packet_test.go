@@ -70,3 +70,42 @@ func TestParseIPv4_TotalLengthShorterThanHeader(t *testing.T) {
 		t.Fatal("expected error for total length shorter than header")
 	}
 }
+
+func TestPacketClass(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol uint8
+		dst      string
+		want     TrafficClass
+	}{
+		{name: "tcp", protocol: ProtocolTCP, dst: "10.66.0.3", want: TrafficTCP},
+		{name: "udp", protocol: ProtocolUDP, dst: "10.66.0.3", want: TrafficUDP},
+		{name: "icmp", protocol: ProtocolICMP, dst: "10.66.0.3", want: TrafficICMP},
+		{name: "multicast", protocol: ProtocolUDP, dst: "224.0.0.251", want: TrafficNoise},
+		{name: "broadcast", protocol: ProtocolUDP, dst: "255.255.255.255", want: TrafficNoise},
+		{name: "igmp", protocol: ProtocolIGMP, dst: "10.66.0.3", want: TrafficNoise},
+		{name: "other", protocol: 47, dst: "10.66.0.3", want: TrafficOther},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkt := make([]byte, 28)
+			pkt[0] = 0x45
+			binary.BigEndian.PutUint16(pkt[2:4], 28)
+			pkt[8] = 64
+			pkt[9] = tt.protocol
+			src := netip.MustParseAddr("10.66.0.2").As4()
+			dst := netip.MustParseAddr(tt.dst).As4()
+			copy(pkt[12:16], src[:])
+			copy(pkt[16:20], dst[:])
+
+			parsed, err := ParseIPv4(pkt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := parsed.Class(); got != tt.want {
+				t.Fatalf("class: got %s want %s", got, tt.want)
+			}
+		})
+	}
+}

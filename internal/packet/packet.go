@@ -25,6 +25,39 @@ type Packet struct {
 	Raw      []byte
 }
 
+const (
+	ProtocolICMP = 1
+	ProtocolTCP  = 6
+	ProtocolUDP  = 17
+	ProtocolIGMP = 2
+)
+
+// TrafficClass describes the forwarding behavior a packet should use.
+type TrafficClass int
+
+const (
+	TrafficOther TrafficClass = iota
+	TrafficTCP
+	TrafficUDP
+	TrafficICMP
+	TrafficNoise
+)
+
+func (tc TrafficClass) String() string {
+	switch tc {
+	case TrafficTCP:
+		return "tcp"
+	case TrafficUDP:
+		return "udp"
+	case TrafficICMP:
+		return "icmp"
+	case TrafficNoise:
+		return "noise"
+	default:
+		return "other"
+	}
+}
+
 // ParseIPv4 parses raw bytes as an IPv4 packet.
 func ParseIPv4(data []byte) (*Packet, error) {
 	if len(data) < 20 {
@@ -70,4 +103,39 @@ func ParseIPv4(data []byte) (*Packet, error) {
 		DstAddr:  dstAddr,
 		Raw:      data[:totalLen],
 	}, nil
+}
+
+// Class returns the traffic class used by pool and relay scheduling.
+func (p *Packet) Class() TrafficClass {
+	if p.IsMulticast() || p.IsLimitedBroadcast() || p.Protocol == ProtocolIGMP {
+		return TrafficNoise
+	}
+	switch p.Protocol {
+	case ProtocolTCP:
+		return TrafficTCP
+	case ProtocolUDP:
+		return TrafficUDP
+	case ProtocolICMP:
+		return TrafficICMP
+	default:
+		return TrafficOther
+	}
+}
+
+// IsMulticast reports whether the destination is in 224.0.0.0/4.
+func (p *Packet) IsMulticast() bool {
+	if !p.DstAddr.Is4() {
+		return false
+	}
+	octets := p.DstAddr.As4()
+	return octets[0] >= 224 && octets[0] <= 239
+}
+
+// IsLimitedBroadcast reports whether the destination is 255.255.255.255.
+func (p *Packet) IsLimitedBroadcast() bool {
+	if !p.DstAddr.Is4() {
+		return false
+	}
+	octets := p.DstAddr.As4()
+	return octets == [4]byte{255, 255, 255, 255}
 }

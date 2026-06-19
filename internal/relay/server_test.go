@@ -72,6 +72,12 @@ func buildTestPacket(src, dst netip.Addr) []byte {
 	return pkt
 }
 
+func buildTestPacketWithProtocol(src, dst netip.Addr, protocol uint8) []byte {
+	pkt := buildTestPacket(src, dst)
+	pkt[9] = protocol
+	return pkt
+}
+
 func TestRelayForwarding(t *testing.T) {
 	// Start server.
 	cfg := &config.ServerConfig{}
@@ -188,4 +194,54 @@ func parseIPv4Simple(data []byte) (*simplePkt, error) {
 	src := netip.AddrFrom4([4]byte(data[12:16]))
 	dst := netip.AddrFrom4([4]byte(data[16:20]))
 	return &simplePkt{src: src, dst: dst}, nil
+}
+
+func TestServerEnqueueTCPWaitsForPrimaryQueue(t *testing.T) {
+	srv := &Server{}
+	primary := &client{
+		WriteCh: make(chan []byte, 1),
+	}
+	primary.WriteCh <- []byte("queued")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan bool, 1)
+	go func() {
+		result <- srv.enqueueTCP(ctx, []*client{primary}, []byte("tcp"))
+	}()
+
+	select {
+	case got := <-result:
+		t.Fatalf("enqueueTCP returned before primary queue drained: %v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	<-primary.WriteCh
+
+	select {
+	case got := <-result:
+		if !got {
+			t.Fatal("enqueueTCP returned false after queue space became available")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("enqueueTCP did not complete after queue space became available")
+	}
+}
+
+func TestServerEnqueueUDPUsesStandbyWhenPrimaryFull(t *testing.T) {
+	srv := &Server{}
+	primary := &client{WriteCh: make(chan []byte, 1)}
+	standby := &client{WriteCh: make(chan []byte, 1)}
+	primary.WriteCh <- []byte("queued")
+
+	if ok := srv.enqueueUDP(context.Background(), []*client{primary, standby}, []byte("udp")); !ok {
+		t.Fatal("enqueueUDP returned false")
+	}
+	if len(primary.WriteCh) != 1 {
+		t.Fatalf("primary queue changed: %d", len(primary.WriteCh))
+	}
+	if got := string(<-standby.WriteCh); got != "udp" {
+		t.Fatalf("standby packet: got %q want udp", got)
+	}
 }

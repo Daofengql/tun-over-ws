@@ -1,181 +1,356 @@
 # Connection Pool Implementation Plan
 
-## Status: Phase 1-6 Complete, Phase 7 (tests) Pending
+## Status
 
-## Overview
+Phase 1-6 were implemented as an initial pool prototype. The current implementation has now changed the pool model from weighted multi-link dispatch plus token-bucket dropping to a fixed primary/standby WebSocket pool with backpressure-driven TCP pacing.
 
-Implement a WebSocket connection pool for the client side with multi-connection support, QoS detection, weighted traffic distribution, and congestion control. Modify the relay server to support multiple connections per UUID.
+Unit tests cover packet classification, client-side pool enqueue behavior, primary promotion, and server-side TCP/UDP enqueue behavior. Real cross-machine overlay validation is still pending for the revised design.
 
-## CDN Rate Limiting Model
+## Design Goal
 
-- CDN/nginx typically rate-limits downstream (server → client direction)
-- We treat it as symmetric (both directions) for simpler bandwidth calculation
-- Client `bytesWritten` (upload) reflects the throttled direction
-- Per-connection limiting: each connection is independently throttled
+The client should keep a fixed-size WebSocket pool for one virtual node:
 
-## Phase 1: Server Multi-Connection Support ✅
+- One primary WebSocket carries normal traffic at any moment.
+- One or more standby WebSockets stay connected and registered for fast failover, timeout rotation, and burst handling.
+- The pool owns reconnection, standby rebuilding, primary promotion, and planned rotation.
+- When the active WebSocket is CDN/nginx throttled, L4 applications behind the TUN should naturally slow down instead of the client reading unlimited TUN packets and dropping them in userspace.
 
-**File: `internal/relay/server.go`**
+This keeps the current "single binary, L3 over WebSocket, relay server" architecture. It does not adopt mihomo's one-local-TCP-connection-to-one-outbound-connection model.
 
-- Change `clients` from `map[string]*client` to `map[string][]*client`
-- Change `vipMap` from `map[netip.Addr]*client` to `map[netip.Addr][]*client`
-- `registerClient`: append to list (no replacement)
-- `unregisterClient`: remove specific connection from list
-- `forwardPacket`: select best connection by `len(WriteCh)` (lowest queue depth)
-- Keep heartbeat per-connection (unchanged)
-- Log total connection count per UUID on register/unregister
+## Backpressure Model
 
-## Phase 2: ✅ Connection State Tracking
+The revised model uses bounded blocking queues rather than a complex global token bucket.
 
-**File: `internal/conn/connstate.go`**
+Desired TCP pacing chain:
 
-- `ConnState` struct per connection:
-  - `peakThroughput` (float64, bytes/sec) - dynamic, window max
-  - `currentThroughput` (float64, bytes/sec) - recent 2s average
-  - `weight` (float64) - `current / peak`, used for traffic distribution
-  - `throttled` (bool) - permanent once set, never resets
-  - `createdAt` (time.Time)
-  - `aliveDuration` (time.Duration) - for timeout detection
-- Throughput tracking:
-  - 200ms sampling buckets, 10s sliding window (50 buckets)
-  - `RecordBytes(n int)` called by write loop
-  - `Update()` called every 200ms, recalculates throughput and weight
-- QoS detection:
-  - 5s warmup period after connection creation
-  - Condition: `peak > 1MB/s AND current < peak * 0.5`
-  - Once `throttled = true`, never reverts
-- Weight: `min(current/peak, 1.0)`, floor 0.1 for throttled connections
+```text
+CDN/nginx throttles WebSocket
+-> websocket Write becomes slow or blocks
+-> primary connection write queue fills
+-> TCP packet enqueue blocks
+-> TUN read loop slows or stops reading
+-> OS/TUN queue applies pressure
+-> inner TCP sessions reduce their send rate
+```
 
-## Phase 3: ✅ Timeout Detector
+Important details:
 
-**File: `internal/conn/timeout.go`**
+- Backpressure is best-effort because TUN behavior differs by OS. It may block, shrink effective receive windows, or eventually drop near the virtual interface. That is still preferable to arbitrary userspace TCP packet dropping.
+- TCP packets should not be dropped just because the pool queue is full. They should normally wait.
+- UDP packets may still be dropped or short-waited because UDP has no reliable congestion feedback.
+- ICMP and local multicast/broadcast should not be allowed to clog the TCP path.
 
-- `TimeoutDetector`:
-  - `samples []time.Duration` (last 5)
-  - `detected time.Duration`
-  - `configured time.Duration` (0 = auto-detect)
-- `RecordDisconnect(duration)`:
-  - Add to samples
-  - If 3+ samples within ±5s of each other → set `detected`
-  - `RotationInterval = detected * 0.8`
-- `GetRotationInterval()`:
-  - If configured > 0, return configured
-  - If detected > 0, return detected * 0.8
-  - Default: 50s
+## Traffic Classes
 
-## Phase 4: ✅ Rate Limiter (Congestion Control)
+Traffic classification is based on IPv4 protocol and destination type.
 
-**File: `internal/conn/ratelimit.go`**
+### TCP
 
-- Token bucket:
-  - `capacity` (float64, bytes) - dynamic, based on aggregate throughput
-  - `tokens` (float64, bytes) - current available
-  - `lastRefill` (time.Time)
-- `UpdateCapacity(conns []*ConnState)`:
-  - Sum all connections' `currentThroughput`
-  - `capacity = sum * 0.8` (20% headroom)
-  - Minimum capacity: 100KB/s (floor to avoid complete stall)
-- `Allow(n int) bool`:
-  - Refill tokens based on elapsed time × capacity
-  - If tokens >= n: consume, return true
-  - Else: return false (drop packet)
-- `ProbeRecovery()`:
-  - Called every 5s when all connections are throttled
-  - Temporarily set capacity to 120%
-  - If no further degradation detected → keep expanded
-  - If degradation → revert
+TCP uses backpressure-first behavior:
 
-## Phase 5: ✅ Connection Pool
+- Prefer the current primary connection.
+- If the primary is healthy but slow, block on its write queue so the TUN read loop slows down.
+- Do not weighted-random individual TCP packets across all WebSockets.
+- Avoid moving packets from an existing TCP flow between WebSockets unless the primary has failed. Packet reordering is more damaging than waiting.
+- On primary failure, promote a standby and resume through the new primary. Inner TCP may retransmit lost packets naturally.
 
-**File: `internal/conn/pool.go`**
+Future optional improvement:
 
-- `Pool` struct:
-  - `conns []*pooledConn` (wraps websocket.Conn + ConnState)
-  - `active []*pooledConn` (connections registered with server)
-  - `maxActive int` (default 2)
-  - `maxTotal int` (default 3)
-  - `timeoutDetector *TimeoutDetector`
-  - `rateLimiter *RateLimiter`
-  - `tunDev *tun.Device`
-  - `serverURL, uuid, token string`
-- Pool lifecycle:
-  - `Connect(ctx)`: establish first connection, create TUN, register with server
-  - `Run(ctx)`: main loop (TUN pump + pool manager + health monitor)
-- TUN → Pool dispatch:
-  - Read packet from TUN
-  - `rateLimiter.Allow(len(packet))` check
-  - If allowed: select connection by weight (weighted random)
-  - If rejected: drop packet (triggers TCP backpressure)
-- Connection selection:
-  - Build weight array from all active connections
-  - Weighted random selection (healthy connections naturally preferred)
-  - Throttled connections receive overflow traffic
-- Pool manager goroutine (runs every 1s):
-  - Check rotation timer → if close to timeout, build new standby
-  - Check QoS state of all connections → mark throttled
-  - If active count < desired and standby available → activate
-  - If active count < desired and no standby → build new
-  - Close dead connections, clean up
-  - Update rate limiter capacity
-- Connection building:
-  - `buildConn(ctx)`: WebSocket dial + hello handshake
-  - Returns registered connection (sends hello to server)
-  - Don't register with server until needed (to avoid replacing active)
-- Graceful shutdown:
-  - Close TUN
-  - Close all WebSocket connections
-  - Wait for goroutines
+- Track a lightweight flow table so new TCP flows can be assigned to a burst standby while old flows remain on the primary. This is optional and should not be required for the first revised implementation.
 
-## Phase 6: ✅ Integration with Existing Client
+### UDP
 
-**File: `internal/conn/client.go`**
+UDP uses lossy bounded behavior:
 
-- Refactor `Conn` to use `Pool` internally
-- `Connect` → `pool.Connect`
-- `Run` → `pool.Run`
-- Keep backward-compatible API
-- Remove old single-connection reconnect logic (pool handles it)
+- Prefer the primary connection while it has space.
+- If the primary queue is full, UDP may use a standby as burst capacity.
+- If no connection can accept quickly, drop UDP.
+- Keep UDP queueing shallow to avoid stale datagrams.
 
-## Phase 7: (pending) Tests
+### ICMP
 
-**File: `internal/relay/server_test.go`**
+ICMP is lightweight and diagnostic:
 
-- Test multi-connection registration: same UUID, 2 connections, both receive packets
-- Test best-connection selection: one full queue, one empty → prefer empty
-- Test unregister: remove one connection, other still works
+- Prefer the primary.
+- Allow a short bounded wait.
+- Drop if the pool is saturated.
 
-**File: `internal/conn/connstate_test.go`**
+### Multicast and Broadcast
 
-- Test throughput tracking: record bytes, verify throughput calculation
-- Test QoS detection: simulate throughput drop, verify throttled flag
-- Test weight calculation: healthy vs throttled weights
+Multicast and broadcast packets should be filtered or deprioritized:
 
-**File: `internal/conn/ratelimit_test.go`**
+- Drop or short-wait local noise such as mDNS, LLMNR, SSDP, IGMP unless a future feature explicitly supports it.
+- Never let multicast/broadcast fill the primary queue.
 
-- Test token bucket: allow/deny based on capacity
-- Test capacity update: sum of connection throughputs
-- Test probe recovery
+## Pool Roles
+
+Each WebSocket in the pool has one role:
+
+```text
+primary  - normal data path
+standby  - registered hot spare, may be used for UDP/burst/failover
+draining - old primary being phased out; no new normal traffic
+dead     - closed or failed, waiting removal/rebuild
+```
+
+Role rules:
+
+- Exactly one alive connection should be primary when the pool is healthy.
+- Standbys are already connected and registered with the server, so failover does not require a new hello round trip.
+- Draining connections should finish queued writes, then close or become dead.
+- Dead connections are removed and replaced while respecting `maxTotal`.
+
+Default sizing:
+
+```text
+max_primary = 1
+max_total   = 3
+```
+
+This means one primary plus up to two standby connections.
+
+## Primary Selection and Switching
+
+Primary switching should be conservative.
+
+Switch immediately when:
+
+- Primary WebSocket read/write fails.
+- Heartbeat fails.
+- Primary age reaches the learned rotation interval.
+
+Switch or build standby when:
+
+- Primary queue remains high for a sustained interval.
+- Primary write latency remains high for a sustained interval.
+- CDN timeout detector predicts the current primary is near forced disconnect.
+
+Do not switch on a single slow write or a single full queue sample. Use hysteresis to avoid thrashing.
+
+Suggested signals:
+
+- `writeLatencyEWMA`
+- `writeQueueDepth`
+- `writeQueueFullSince`
+- `bytesWritten`
+- `age`
+- heartbeat state
+
+The initial implementation can keep the existing throughput and timeout detectors as observability signals, but they should not be responsible for dropping TCP packets.
+
+## Client Data Path
+
+Revised client TUN-to-pool flow:
+
+```text
+read packet from TUN
+parse IPv4 header
+classify traffic
+
+TCP:
+  enqueue to primary with blocking semantics
+  if primary dead, promote standby and retry
+  if context canceled, stop
+
+UDP:
+  try primary non-blocking
+  if full, try standby non-blocking or short-wait
+  if still full, drop
+
+ICMP:
+  short-wait primary
+  drop on timeout
+
+multicast/broadcast/noise:
+  drop or short-wait according to policy
+```
+
+This replaces:
+
+```text
+rateLimiter.Allow(packet)
+weighted random connection selection
+drop when selected writeCh is full
+```
+
+with:
+
+```text
+bounded queues
+blocking TCP enqueue
+lossy UDP enqueue
+primary/standby promotion
+```
+
+## Server Data Path
+
+The relay server already supports multiple connections per UUID/VIP. The revised server behavior should mirror client-side class handling when forwarding to a target client:
+
+- Select the target client's primary connection for TCP by default.
+- If the target primary is dead, promote one of the target standbys.
+- For TCP, avoid dropping solely because the target write queue is full; block or wait with a long enough context to create backpressure toward the sender side.
+- For UDP, allow non-blocking standby burst or drop.
+- For ICMP, short-wait or drop.
+
+Server-side backpressure matters because client A sending to client B should slow down when B's active WebSocket is throttled. If the server drops immediately, A's TUN side cannot receive a clean pressure signal.
+
+## Connection State
+
+Keep per-connection state, but refocus it from weighted scheduling to lifecycle and diagnostics.
+
+Fields to keep or add:
+
+- `role`
+- `alive`
+- `createdAt`
+- `lastWriteAt`
+- `lastReadAt`
+- `bytesWritten`
+- `bytesRead`
+- `writeLatencyEWMA`
+- `queueDepth`
+- `queueFullSince`
+- `throttled` or `degraded` as an advisory flag
+
+The `ConnState` throughput sampler can remain, but the first revised implementation should not depend on token-bucket capacity calculations.
+
+## Timeout and Rotation
+
+Keep the timeout detector:
+
+- Record connection lifetimes on disconnect.
+- Detect repeated forced disconnects.
+- Build a standby before the predicted cutoff.
+- Promote the standby before the old primary is killed by the CDN/nginx.
+- Move the old primary to draining or close it after promotion.
+
+This is one of the main reasons to keep hot standbys.
+
+## Congestion Control Direction
+
+Retire the token-bucket packet dropper as the main congestion-control mechanism.
+
+Why:
+
+- It guesses capacity from observed throughput.
+- It can drop inner TCP packets at arbitrary points.
+- It adds complexity while bypassing the natural TUN/TCP feedback loop.
+
+Replacement:
+
+- Use bounded blocking queues for TCP.
+- Use write latency and queue depth as degradation signals.
+- Use standby connections for failover and optional UDP/burst handling.
+- Keep explicit dropping for UDP, multicast/broadcast, malformed packets, and shutdown.
+
+`internal/conn/ratelimit.go` can be removed later or kept temporarily behind a disabled flag until the revised pool is validated.
+
+## Implementation Phases
+
+### Phase A: Packet Classification ✅
+
+Files:
+
+- `internal/packet`
+- `internal/conn/pool.go`
+- `internal/relay/server.go`
+
+Tasks:
+
+- Expose IPv4 protocol from parsed packets.
+- Add helpers for TCP, UDP, ICMP, multicast, and broadcast classification.
+- Avoid repeated ad hoc parsing in client and server paths.
+
+### Phase B: Pool Roles ✅
+
+File: `internal/conn/pool.go`
+
+Tasks:
+
+- Add connection roles: primary, standby, draining, dead.
+- Track a single primary pointer or primary connection ID.
+- Build initial primary plus standby connections according to `maxTotal`.
+- Ensure standby VIP matches the pool VIP.
+- Promote standby on primary failure.
+- Rebuild standby after promotion.
+
+### Phase C: Backpressure Dispatch ✅
+
+File: `internal/conn/pool.go`
+
+Tasks:
+
+- Replace weighted random packet dispatch with traffic-class dispatch.
+- TCP enqueue blocks on the primary write queue.
+- UDP enqueue is non-blocking or short-wait and may use standby.
+- ICMP enqueue short-waits.
+- Multicast/broadcast gets dropped or deprioritized.
+- Remove token-bucket `Allow` from the hot path.
+
+### Phase D: Server Primary/Standby Awareness ✅
+
+File: `internal/relay/server.go`
+
+Tasks:
+
+- Pick inferred primary for TCP forwarding. The first alive connection for a VIP is treated as primary.
+- Use blocking or longer-wait enqueue for TCP.
+- Keep UDP lossy and allow standby burst.
+
+Explicit client-to-server role synchronization is not implemented yet. The server infers primary as the first alive connection for that VIP.
+
+### Phase E: Lifecycle and Metrics ✅ / partial
+
+Files:
+
+- `internal/conn/connstate.go`
+- `internal/conn/timeout.go`
+- `internal/relay/server.go`
+
+Tasks:
+
+- Queue pressure tracking is implemented for standby building.
+- Write latency EWMA is still pending.
+- Keep heartbeat per connection.
+- Keep timeout rotation.
+- Log primary promotion, standby rebuild, degraded primary, UDP drops, and TCP waits.
+
+### Phase F: Tests ✅ / partial
+
+Tests to add or update:
+
+- TCP enqueue blocks instead of dropping when primary queue is full.
+- UDP uses standby when primary queue is full.
+- Primary failure promotes standby.
+- Standby rebuild scheduling respects `maxTotal`.
+- Primary rotation promotes standby and marks the old primary as draining.
+- Timeout rotation triggers planned promotion.
+- Server forwarding does not immediately drop TCP on full target queue.
+- Existing unit tests pass.
+
+Still pending:
+
+- Real Windows/Linux overlay ping tests for this revised pool.
 
 ## File Changes Summary
 
 | File | Action |
 |------|--------|
-| `internal/relay/server.go` | Modify: multi-conn per UUID, best-path selection |
-| `internal/conn/connstate.go` | New: throughput tracking, QoS detection, weights |
-| `internal/conn/timeout.go` | New: auto-detect CDN timeout limits |
-| `internal/conn/ratelimit.go` | New: token bucket congestion control |
-| `internal/conn/pool.go` | New: connection pool manager |
-| `internal/conn/client.go` | Modify: delegate to Pool |
-| `internal/relay/server_test.go` | Modify: multi-conn tests |
-| `internal/conn/connstate_test.go` | New |
-| `internal/conn/ratelimit_test.go` | New |
+| `internal/packet` | Add traffic classification helpers |
+| `internal/conn/pool.go` | Change weighted pool into primary/standby backpressure pool |
+| `internal/conn/connstate.go` | Refocus metrics on lifecycle, queue, write latency |
+| `internal/conn/timeout.go` | Keep for planned rotation |
+| `internal/conn/ratelimit.go` | Deprecate or remove from hot path |
+| `internal/relay/server.go` | Add TCP-aware forwarding wait and optional role awareness |
+| `docs/ARCHITECTURE.md` | Update after implementation |
+| `docs/ROADMAP.md` | Update after implementation |
 
-## Implementation Order
+## Acceptance Criteria
 
-1. Phase 1 (server) — independent, can be tested immediately
-2. Phase 2 (connstate) — foundation for everything else
-3. Phase 3 (timeout) — simple, standalone
-4. Phase 4 (ratelimit) — depends on connstate concepts
-5. Phase 5 (pool) — ties everything together
-6. Phase 6 (integration) — wire into existing client
-7. Phase 7 (tests) — throughout, but comprehensive pass at end
+- The pool keeps exactly one primary under normal operation.
+- Standby connections stay connected and can be promoted without creating a new TUN.
+- When the primary WebSocket is slow, TCP enqueue waits instead of dropping packets immediately.
+- UDP does not block TCP and can be dropped under pressure.
+- Client and server both avoid immediate TCP drop on full queues.
+- Existing Windows/Linux overlay ping still works.
+- No tracked config/testdata or remote connection information is added to the repo.

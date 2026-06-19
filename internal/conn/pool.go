@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -19,15 +18,27 @@ import (
 )
 
 const (
-	defaultMaxActive    = 2
-	defaultMaxTotal     = 3
-	writeChSize         = 512
-	monitorInterval     = 1 * time.Second
-	stateUpdateInterval = 200 * time.Millisecond
-	connectionTimeout   = 15 * time.Second
-	poolPingInterval    = 30 * time.Second
-	poolReadTimeout     = 90 * time.Second
-	poolWriteTimeout    = 5 * time.Second
+	defaultMaxTotal      = 3
+	writeChSize          = 512
+	monitorInterval      = 1 * time.Second
+	stateUpdateInterval  = 200 * time.Millisecond
+	connectionTimeout    = 15 * time.Second
+	poolPingInterval     = 30 * time.Second
+	poolReadTimeout      = 90 * time.Second
+	poolWriteTimeout     = 30 * time.Second
+	waitPrimaryInterval  = 100 * time.Millisecond
+	udpBurstWait         = 10 * time.Millisecond
+	icmpEnqueueWait      = 100 * time.Millisecond
+	queueHighWatermark   = 0.8
+	queuePressureSamples = 3
+)
+
+type connRole string
+
+const (
+	rolePrimary  connRole = "primary"
+	roleStandby  connRole = "standby"
+	roleDraining connRole = "draining"
 )
 
 // pooledConn wraps a WebSocket connection with its state.
@@ -36,11 +47,13 @@ type pooledConn struct {
 	state   *ConnState
 	writeCh chan []byte
 	vip     netip.Addr
+	role    connRole
 
 	writeMu   sync.Mutex
 	alive     atomic.Bool
 	closeOnce sync.Once
 	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 // Pool manages multiple WebSocket connections with QoS-aware routing.
@@ -58,11 +71,10 @@ type Pool struct {
 	tunDev    *tun.Device
 	virtualIP netip.Addr
 
-	maxActive     int
 	maxTotal      int
 	pendingBuilds int
 	timeoutDetect *TimeoutDetector
-	rateLimiter   *RateLimiter
+	pressureTicks int
 
 	log zerolog.Logger
 }
@@ -81,10 +93,8 @@ func NewPool(serverURL, uuid, token, tunName string, mtu int) *Pool {
 		token:         token,
 		tunName:       tunName,
 		mtu:           mtu,
-		maxActive:     defaultMaxActive,
 		maxTotal:      defaultMaxTotal,
 		timeoutDetect: NewTimeoutDetector(0),
-		rateLimiter:   NewRateLimiter(10 * 1024 * 1024), // 10MB/s initial
 		log:           logger.Logger.With().Str("component", "pool").Logger(),
 	}
 }
@@ -112,8 +122,10 @@ func (p *Pool) Connect(ctx context.Context) error {
 
 	p.startConn(ctx, pc)
 	p.mu.Lock()
+	pc.role = rolePrimary
 	p.conns = append(p.conns, pc)
 	p.mu.Unlock()
+	p.ensureStandbys(ctx)
 
 	p.log.Info().
 		Str("vip", pc.vip.String()).
@@ -178,7 +190,7 @@ func (p *Pool) Run(ctx context.Context) error {
 	return nil
 }
 
-// tunToPool reads packets from TUN and dispatches to the best connection.
+// tunToPool reads packets from TUN and dispatches by traffic class.
 func (p *Pool) tunToPool(ctx context.Context) {
 	bufSize := p.mtu
 	if bufSize < 1500 {
@@ -203,31 +215,89 @@ func (p *Pool) tunToPool(ctx context.Context) {
 			continue
 		}
 
-		// Rate limit check.
-		if !p.rateLimiter.Allow(n) {
-			p.log.Debug().Int("bytes", n).Msg("rate limited, dropping")
-			continue
-		}
-
 		raw := make([]byte, n)
 		copy(raw, buf[:n])
 
-		pc := p.selectConn()
-		if pc == nil {
-			p.log.Warn().Msg("no available connection, dropping")
+		pkt, err := packet.ParseIPv4(raw)
+		if err != nil {
+			p.log.Debug().Err(err).Msg("tun: invalid packet")
 			continue
 		}
-		if !pc.isAlive() {
-			p.log.Debug().Msg("selected connection died before dispatch")
-			continue
-		}
+		p.log.Debug().
+			Str("src", pkt.SrcAddr.String()).
+			Str("dst", pkt.DstAddr.String()).
+			Str("class", pkt.Class().String()).
+			Int("bytes", n).
+			Msg("tun -> pool")
 
-		select {
-		case pc.writeCh <- raw:
-		default:
-			p.log.Warn().Msg("selected conn full, dropping")
+		if !p.dispatchPacket(ctx, pkt, raw) && ctx.Err() == nil {
+			p.log.Debug().
+				Str("src", pkt.SrcAddr.String()).
+				Str("dst", pkt.DstAddr.String()).
+				Str("class", pkt.Class().String()).
+				Int("bytes", n).
+				Msg("packet dropped")
 		}
 	}
+}
+
+func (p *Pool) dispatchPacket(ctx context.Context, pkt *packet.Packet, raw []byte) bool {
+	switch pkt.Class() {
+	case packet.TrafficTCP:
+		return p.enqueueTCP(ctx, raw)
+	case packet.TrafficUDP:
+		return p.enqueueUDP(ctx, raw)
+	case packet.TrafficICMP, packet.TrafficOther:
+		return p.enqueuePrimaryWithTimeout(ctx, raw, icmpEnqueueWait)
+	case packet.TrafficNoise:
+		return false
+	default:
+		return p.enqueuePrimaryWithTimeout(ctx, raw, icmpEnqueueWait)
+	}
+}
+
+func (p *Pool) enqueueTCP(ctx context.Context, raw []byte) bool {
+	for ctx.Err() == nil {
+		pc := p.primaryOrWait(ctx)
+		if pc == nil {
+			return false
+		}
+
+		ok, closed := pc.enqueue(ctx, raw)
+		if ok {
+			return true
+		}
+		if closed {
+			continue
+		}
+		return false
+	}
+	return false
+}
+
+func (p *Pool) enqueueUDP(ctx context.Context, raw []byte) bool {
+	candidates := p.burstCandidates()
+	for _, pc := range candidates {
+		if ok := pc.tryEnqueue(raw); ok {
+			return true
+		}
+	}
+
+	primary := p.primary()
+	if primary == nil || !primary.isAlive() {
+		return false
+	}
+
+	return primary.enqueueWithTimeout(ctx, raw, udpBurstWait)
+}
+
+func (p *Pool) enqueuePrimaryWithTimeout(ctx context.Context, raw []byte, timeout time.Duration) bool {
+	pc := p.primaryOrWait(ctx)
+	if pc == nil {
+		return false
+	}
+
+	return pc.enqueueWithTimeout(ctx, raw, timeout)
 }
 
 // readConn reads from a single connection and writes to TUN.
@@ -310,48 +380,146 @@ func (p *Pool) heartbeatConn(ctx context.Context, pc *pooledConn) {
 	}
 }
 
-// selectConn picks the best connection using weighted random selection.
-func (p *Pool) selectConn() *pooledConn {
+func (p *Pool) primary() *pooledConn {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, pc := range p.conns {
+		if pc.role == rolePrimary && pc.isAlive() {
+			return pc
+		}
+	}
+	return nil
+}
+
+func (p *Pool) primaryOrWait(ctx context.Context) *pooledConn {
+	for ctx.Err() == nil {
+		if pc := p.primary(); pc != nil {
+			return pc
+		}
+
+		p.mu.Lock()
+		p.ensurePrimaryLocked(ctx)
+		p.mu.Unlock()
+
+		if pc := p.primary(); pc != nil {
+			return pc
+		}
+
+		timer := time.NewTimer(waitPrimaryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func (p *Pool) burstCandidates() []*pooledConn {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	// Collect alive connections with positive weights.
-	type candidate struct {
-		conn   *pooledConn
-		weight float64
-	}
-	var candidates []candidate
-	var totalWeight float64
-
+	candidates := make([]*pooledConn, 0, len(p.conns))
 	for _, pc := range p.conns {
-		if !pc.isAlive() {
-			continue
+		if pc.role == rolePrimary && pc.isAlive() {
+			candidates = append(candidates, pc)
 		}
-		w := pc.state.Weight()
-		if w <= 0 {
-			continue
+	}
+	for _, pc := range p.conns {
+		if pc.role == roleStandby && pc.isAlive() {
+			candidates = append(candidates, pc)
 		}
-		candidates = append(candidates, candidate{pc, w})
-		totalWeight += w
+	}
+	return candidates
+}
+
+func (p *Pool) ensurePrimaryLocked(ctx context.Context) {
+	for _, pc := range p.conns {
+		if pc.role == rolePrimary && pc.isAlive() {
+			return
+		}
+	}
+	if promoted := p.promoteStandbyLocked(); promoted != nil {
+		p.log.Info().Str("vip", promoted.vip.String()).Msg("standby promoted to primary")
+		p.scheduleBuildLocked(ctx)
+		return
+	}
+	p.scheduleBuildLocked(ctx)
+}
+
+func (p *Pool) promoteStandbyLocked() *pooledConn {
+	for _, pc := range p.conns {
+		if pc.role == roleStandby && pc.isAlive() {
+			pc.role = rolePrimary
+			return pc
+		}
+	}
+	for _, pc := range p.conns {
+		if pc.isAlive() && pc.role != roleDraining {
+			pc.role = rolePrimary
+			return pc
+		}
+	}
+	return nil
+}
+
+func (p *Pool) rotatePrimaryLocked(ctx context.Context, reason string) {
+	var current *pooledConn
+	for _, pc := range p.conns {
+		if pc.role == rolePrimary && pc.isAlive() {
+			current = pc
+			break
+		}
+	}
+	if current == nil {
+		p.ensurePrimaryLocked(ctx)
+		return
 	}
 
-	if len(candidates) == 0 {
-		return nil
-	}
-	if len(candidates) == 1 {
-		return candidates[0].conn
-	}
-
-	// Weighted random.
-	r := rand.Float64() * totalWeight
-	var cum float64
-	for _, c := range candidates {
-		cum += c.weight
-		if r <= cum {
-			return c.conn
+	var next *pooledConn
+	for _, pc := range p.conns {
+		if pc.role == roleStandby && pc.isAlive() {
+			next = pc
+			break
 		}
 	}
-	return candidates[len(candidates)-1].conn
+	if next == nil {
+		p.scheduleBuildLocked(ctx)
+		return
+	}
+
+	current.role = roleDraining
+	next.role = rolePrimary
+	p.log.Info().
+		Str("reason", reason).
+		Dur("old_age", current.state.Age()).
+		Msg("primary rotated")
+	go p.closeAfterDrain(current, 5*time.Second)
+	p.scheduleBuildLocked(ctx)
+}
+
+func (p *Pool) closeAfterDrain(pc *pooledConn, maxWait time.Duration) {
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if len(pc.writeCh) == 0 {
+			pc.close()
+			return
+		}
+		select {
+		case <-pc.done:
+			return
+		case <-ticker.C:
+		case <-timer.C:
+			pc.close()
+			return
+		}
+	}
 }
 
 // monitor manages connection lifecycle: rotation, QoS, standby building.
@@ -372,18 +540,6 @@ func (p *Pool) monitor(ctx context.Context) {
 }
 
 func (p *Pool) monitorTick(ctx context.Context) {
-	// Count alive connections.
-	alive := 0
-	throttled := 0
-	for _, pc := range p.conns {
-		if pc.isAlive() {
-			alive++
-			if pc.state.IsThrottled() {
-				throttled++
-			}
-		}
-	}
-
 	// Remove dead connections.
 	var live []*pooledConn
 	for _, pc := range p.conns {
@@ -395,52 +551,50 @@ func (p *Pool) monitorTick(ctx context.Context) {
 		}
 	}
 	p.conns = live
-	alive = 0
-	throttled = 0
-	for _, pc := range live {
-		if pc.isAlive() {
-			alive++
-			if pc.state.IsThrottled() {
-				throttled++
-			}
-		}
-	}
 
-	if alive == 0 {
-		p.log.Warn().Msg("no alive connections, rebuilding")
-		p.scheduleBuildLocked(ctx)
-		return
-	}
+	p.ensurePrimaryLocked(ctx)
 
-	// Check rotation: if oldest active connection is near timeout limit.
 	rotationInterval := p.timeoutDetect.GetRotationInterval()
 	for _, pc := range p.conns {
-		if pc.state.Age() > rotationInterval && alive <= p.maxActive {
+		if pc.role == rolePrimary && pc.isAlive() && pc.state.Age() > rotationInterval {
 			p.log.Info().
 				Dur("age", pc.state.Age()).
 				Dur("rotation", rotationInterval).
-				Msg("rotation threshold reached, building standby")
-			p.scheduleBuildLocked(ctx)
+				Msg("rotation threshold reached")
+			p.rotatePrimaryLocked(ctx, "rotation")
 			break
 		}
 	}
 
-	// If all active are throttled and we have capacity, build more.
-	if throttled == alive && alive > 0 && len(p.conns) < p.maxTotal {
-		p.log.Info().Int("throttled", throttled).Msg("all throttled, building new conn")
-		p.scheduleBuildLocked(ctx)
+	if primary := p.primaryLocked(); primary != nil && p.queuePressure(primary) {
+		p.pressureTicks++
+	} else {
+		p.pressureTicks = 0
 	}
-
-	// Update rate limiter.
-	var states []*ConnState
-	for _, pc := range p.conns {
-		if pc.isAlive() {
-			states = append(states, pc.state)
+	if p.pressureTicks >= queuePressureSamples {
+		if primary := p.primaryLocked(); primary != nil {
+			p.log.Debug().Int("queue", len(primary.writeCh)).Msg("primary queue under pressure")
+			p.scheduleBuildLocked(ctx)
 		}
 	}
-	if len(states) > 0 {
-		p.rateLimiter.UpdateCapacity(states)
+
+	p.ensureStandbysLocked(ctx)
+}
+
+func (p *Pool) primaryLocked() *pooledConn {
+	for _, pc := range p.conns {
+		if pc.role == rolePrimary && pc.isAlive() {
+			return pc
+		}
 	}
+	return nil
+}
+
+func (p *Pool) queuePressure(pc *pooledConn) bool {
+	if pc == nil || cap(pc.writeCh) == 0 {
+		return false
+	}
+	return float64(len(pc.writeCh))/float64(cap(pc.writeCh)) >= queueHighWatermark
 }
 
 func (p *Pool) scheduleBuildLocked(ctx context.Context) {
@@ -449,6 +603,21 @@ func (p *Pool) scheduleBuildLocked(ctx context.Context) {
 	}
 	p.pendingBuilds++
 	go p.buildStandby(ctx)
+}
+
+func (p *Pool) ensureStandbys(ctx context.Context) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ensureStandbysLocked(ctx)
+}
+
+func (p *Pool) ensureStandbysLocked(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	for len(p.conns)+p.pendingBuilds < p.maxTotal {
+		p.scheduleBuildLocked(ctx)
+	}
 }
 
 // buildStandby creates a new connection and adds it to the pool.
@@ -480,8 +649,9 @@ func (p *Pool) buildStandby(ctx context.Context) {
 		pc.close()
 		return
 	}
+	pc.role = roleStandby
 	p.conns = append(p.conns, pc)
-	p.log.Info().Int("pool_size", len(p.conns)).Msg("standby added")
+	p.log.Info().Int("pool_size", len(p.conns)).Str("role", string(pc.role)).Msg("standby added")
 	p.mu.Unlock()
 
 	p.startConn(ctx, pc)
@@ -510,6 +680,8 @@ func (p *Pool) buildConn(ctx context.Context) (*pooledConn, error) {
 		state:   NewConnState(),
 		writeCh: make(chan []byte, writeChSize),
 		vip:     vip,
+		role:    roleStandby,
+		done:    make(chan struct{}),
 	}
 	pc.alive.Store(true)
 
@@ -596,13 +768,86 @@ func (pc *pooledConn) isAlive() bool {
 	return pc.alive.Load()
 }
 
+func (pc *pooledConn) tryEnqueue(data []byte) bool {
+	if !pc.isAlive() {
+		return false
+	}
+	select {
+	case <-pc.done:
+		return false
+	default:
+	}
+	select {
+	case pc.writeCh <- data:
+		return pc.isAlive()
+	case <-pc.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func (pc *pooledConn) enqueue(ctx context.Context, data []byte) (ok bool, closed bool) {
+	if !pc.isAlive() {
+		return false, true
+	}
+	select {
+	case <-pc.done:
+		return false, true
+	default:
+	}
+	select {
+	case pc.writeCh <- data:
+		if !pc.isAlive() {
+			return false, true
+		}
+		return true, false
+	case <-pc.done:
+		return false, true
+	case <-ctx.Done():
+		return false, false
+	}
+}
+
+func (pc *pooledConn) enqueueWithTimeout(ctx context.Context, data []byte, timeout time.Duration) bool {
+	if timeout <= 0 {
+		ok, _ := pc.enqueue(ctx, data)
+		return ok
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	if !pc.isAlive() {
+		return false
+	}
+	select {
+	case <-pc.done:
+		return false
+	default:
+	}
+	select {
+	case pc.writeCh <- data:
+		return pc.isAlive()
+	case <-pc.done:
+		return false
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
 func (pc *pooledConn) close() {
 	pc.closeOnce.Do(func() {
 		pc.alive.Store(false)
 		if pc.cancel != nil {
 			pc.cancel()
 		}
-		pc.ws.CloseNow()
+		if pc.ws != nil {
+			pc.ws.CloseNow()
+		}
+		close(pc.done)
 	})
 }
 

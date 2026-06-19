@@ -19,7 +19,12 @@ import (
 	"github.com/Daofengql/tun-over-ws/internal/packet"
 )
 
-const pingInterval = 30 * time.Second
+const (
+	pingInterval         = 30 * time.Second
+	relayTCPEnqueueWait  = 30 * time.Second
+	relayUDPEnqueueWait  = 10 * time.Millisecond
+	relayICMPEnqueueWait = 100 * time.Millisecond
+)
 
 // client represents a connected client.
 type client struct {
@@ -276,12 +281,20 @@ func removeConn(list []*client, target *client) []*client {
 	return list
 }
 
-// selectBest picks the open connection with the most available WriteCh capacity.
-func selectBest(conns []*client) *client {
+func selectPrimary(conns []*client) *client {
+	for _, c := range conns {
+		if !c.closed.Load() {
+			return c
+		}
+	}
+	return nil
+}
+
+func selectBestStandby(conns []*client, primary *client) *client {
 	var best *client
 	bestAvail := -1
 	for _, c := range conns {
-		if c.closed.Load() {
+		if c == primary || c.closed.Load() {
 			continue
 		}
 		avail := cap(c.WriteCh) - len(c.WriteCh)
@@ -349,11 +362,11 @@ func (s *Server) readLoop(ctx context.Context, c *client) {
 			continue
 		}
 
-		s.forwardPacket(c, pkt, data)
+		s.forwardPacket(ctx, c, pkt, data)
 	}
 }
 
-func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
+func (s *Server) forwardPacket(ctx context.Context, from *client, pkt *packet.Packet, raw []byte) {
 	dst := pkt.DstAddr
 
 	// Check overlay: is destination in our CIDR?
@@ -370,28 +383,19 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 			return
 		}
 
-		// Select connection with most available WriteCh space.
-		target := selectBest(conns)
-		if target == nil {
+		if s.enqueueOverlay(ctx, conns, pkt, raw) {
 			s.log.Debug().
 				Str("from", from.VirtualIP.String()).
 				Str("dst", dst.String()).
-				Msg("no open dst connection, dropping")
-			return
-		}
-
-		select {
-		case target.WriteCh <- raw:
-			s.log.Debug().
-				Str("from", from.VirtualIP.String()).
-				Str("dst", dst.String()).
+				Str("class", pkt.Class().String()).
 				Int("bytes", len(raw)).
-				Int("queue", len(target.WriteCh)).
 				Msg("forwarded")
-		default:
-			s.log.Warn().
+		} else {
+			s.log.Debug().
+				Str("from", from.VirtualIP.String()).
 				Str("dst", dst.String()).
-				Msg("all connections full, dropping")
+				Str("class", pkt.Class().String()).
+				Msg("forward drop")
 		}
 		return
 	}
@@ -409,6 +413,92 @@ func (s *Server) forwardPacket(from *client, pkt *packet.Packet, raw []byte) {
 		Str("from", from.VirtualIP.String()).
 		Str("dst", dst.String()).
 		Msg("exit traffic (TUN not implemented yet)")
+}
+
+func (s *Server) enqueueOverlay(ctx context.Context, conns []*client, pkt *packet.Packet, raw []byte) bool {
+	switch pkt.Class() {
+	case packet.TrafficTCP:
+		return s.enqueueTCP(ctx, conns, raw)
+	case packet.TrafficUDP:
+		return s.enqueueUDP(ctx, conns, raw)
+	case packet.TrafficICMP, packet.TrafficOther:
+		return s.enqueuePrimaryWithTimeout(ctx, conns, raw, relayICMPEnqueueWait)
+	case packet.TrafficNoise:
+		return false
+	default:
+		return s.enqueuePrimaryWithTimeout(ctx, conns, raw, relayICMPEnqueueWait)
+	}
+}
+
+func (s *Server) enqueueTCP(ctx context.Context, conns []*client, raw []byte) bool {
+	target := selectPrimary(conns)
+	if target == nil {
+		return false
+	}
+
+	timer := time.NewTimer(relayTCPEnqueueWait)
+	defer timer.Stop()
+	select {
+	case target.WriteCh <- raw:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *Server) enqueueUDP(ctx context.Context, conns []*client, raw []byte) bool {
+	primary := selectPrimary(conns)
+	if primary != nil {
+		select {
+		case primary.WriteCh <- raw:
+			return true
+		default:
+		}
+	}
+
+	standby := selectBestStandby(conns, primary)
+	if standby != nil {
+		select {
+		case standby.WriteCh <- raw:
+			return true
+		default:
+		}
+	}
+
+	if primary == nil {
+		return false
+	}
+
+	timer := time.NewTimer(relayUDPEnqueueWait)
+	defer timer.Stop()
+	select {
+	case primary.WriteCh <- raw:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *Server) enqueuePrimaryWithTimeout(ctx context.Context, conns []*client, raw []byte, timeout time.Duration) bool {
+	target := selectPrimary(conns)
+	if target == nil {
+		return false
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case target.WriteCh <- raw:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
 }
 
 func (s *Server) writeLoop(ctx context.Context, c *client) {
