@@ -27,6 +27,15 @@ Remove-Item Env:\GOARCH
 
 不要提交 `bin/`、二进制、`wintun.dll`、日志、`configs/` 或 `testdata/`。
 
+## 测试和文件约定
+
+- 测试用的配置文件全部放在 `testdata/` 下，非必要不创建多个版本的 YAML。
+- 构建产物放在 `bin/`，不要提交。
+- `iperf3` 位于 `bin/iperf3-win/`，性能测试时可直接使用，测试端口推荐 26001（远程 ufw 放行 20000-30000）。
+- 测试产生的日志文件用完即删除；如需保留，放在 `testdata/logs/` 下，不要提交。
+- 远端部署的临时文件放在目标用户主目录下，测试完毕后清理。
+- 不要在文档或提交中写入远端 IP、登录信息、token 或临时 URL。
+
 ## 本地 Windows 运行
 
 需要管理员 PowerShell：
@@ -74,9 +83,9 @@ ping -S 10.66.0.2 10.66.0.3
 - Windows/Linux 二进制构建通过。
 - Windows 单机双客户端 overlay ping 通过。
 - Linux 服务端 + Linux 客户端 + Windows 客户端 overlay ping 通过。
-- `iperf3` UDP 1M/5M 双向 0% 丢包。
-- `iperf3` TCP 双向可通，但 Linux -> Windows 方向吞吐低且重传多。
-- 修复后，压测期间没有再出现无故 primary 轮换、standby 空闲读超时导致的误判重连。
+- `iperf3` UDP 10M 双向 0% 丢包。
+- `iperf3` TCP 双向 42-54 Mbits/sec，Linux -> Windows 方向 0 次重传。
+- 压测期间没有再出现无故 primary 轮换、standby 空闲读超时导致的误判重连。
 
 ## 已知边界
 

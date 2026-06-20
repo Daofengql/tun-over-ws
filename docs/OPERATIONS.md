@@ -150,43 +150,52 @@ ping -S 10.66.0.3 10.66.0.2
 
 可以用 `iperf3` 验证 TCP/UDP 双向转发。示例中 Windows 是 `10.66.0.3`，Linux 是 `10.66.0.2`。
 
+iperf3 二进制位于 `bin/iperf3-win/` 目录下，可直接用于测试。
+
+注意：测试端口应选择 ufw 未拦截的端口。远程 Linux 服务器上 ufw 放行了 20000-30000 范围，推荐使用 **26001**。5201 在 DROP 范围（444:5243）内，不可用。
+
 Windows 启动 server：
 
 ```powershell
-.\iperf3.exe -s -B 10.66.0.3 -p 5201
+bin\iperf3-win\iperf3.exe -s -B 10.66.0.3 -p 26001
 ```
 
 Linux -> Windows TCP：
 
 ```bash
-iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 5201 -t 10 -M 1000
+iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 26001 -t 10
 ```
 
 Windows -> Linux TCP：
 
 ```bash
-iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 5201 -t 10 -M 1000 -R --get-server-output
+iperf3 -c 10.66.0.2 -B 10.66.0.3 -p 26001 -t 10
 ```
 
 Linux -> Windows UDP：
 
 ```bash
-iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 5201 -t 10 -u -b 5M -l 1000
+iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 26001 -t 10 -u -b 10M -l 1000
 ```
 
 Windows -> Linux UDP：
 
 ```bash
-iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 5201 -t 10 -u -b 5M -l 1000 -R
+iperf3 -c 10.66.0.2 -B 10.66.0.3 -p 26001 -t 10 -u -b 10M -l 1000
 ```
 
-当前一次跨平台远端测试观察：
+### 跨平台远端测试记录（2026-06-20）
 
-- UDP 1M/5M 双向 0% 丢包。
-- TCP 双向可通。
-- Windows -> Linux TCP 明显好于 Linux -> Windows。
-- Linux -> Windows TCP 吞吐低且重传多，后续需继续定位。
-- 压测期间没有再出现无故 primary 轮换或连接池重连风暴。
+测试环境：Linux 服务端 + Linux 客户端（海外 Ubuntu 24.04）+ Windows 客户端（本地），overlay 跨公网中继。
+
+| 方向 | 协议 | 吞吐 | 重传/丢包 |
+| ---- | ---- | ---- | --------- |
+| Windows -> Linux | TCP | 42-44 Mbits/sec | — |
+| Linux -> Windows | TCP | 51-54 Mbits/sec | 0 次重传 |
+| Windows -> Linux | UDP 10M | 9.98 Mbits/sec | 0% 丢包 |
+| Linux -> Windows | UDP 10M | 10.0 Mbits/sec | 0% 丢包 |
+
+与早期测试相比，Linux -> Windows TCP 方向从吞吐低、重传多改善到 0 重传、54 Mbits/sec。
 
 远端链路 RTT 高时，吞吐数字只能作为功能和稳定性信号，不应当作为最终性能结论。
 
