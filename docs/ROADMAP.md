@@ -95,7 +95,7 @@
 
 - 心跳（30s WebSocket Ping，每连接独立）。
 - 连接池：固定大小 WS 池，单 primary + 多 standby，自动补建和轮换。
-- TCP 背压：TCP 包进入 primary 有界队列，队列满时阻塞 TUN 读取路径，不再用令牌桶主动丢 TCP。
+- TCP 背压：TCP flow 绑定到单条 WebSocket；已有 flow 不跨连接乱序，新 flow 可在 primary 退化/高压时尝试 standby，队列满时阻塞 TUN 读取路径，不再用令牌桶主动丢 TCP。
 - UDP 独立策略：primary 满时可尝试 standby，仍不可用则快速丢弃。
 - QoS 检测：单连接吞吐追踪，动态 peak，作为观测信号保留。
 - 连接状态指标：读写字节、最后读写时间、写延迟 EWMA、队列深度快照。
@@ -106,12 +106,13 @@
 - 多 readConn 写 TUN 时通过 tunWriteMu 串行化。
 - 服务端连接生命周期受根 context 控制，服务端退出时能推动连接关闭。
 - 服务端 overlay 转发按 TCP/UDP/ICMP 分类处理，避免 TCP 目标队列满时立即丢包。
+- 服务端 overlay 转发维护 TCP flow 绑定，已有 flow 固定到同一目标连接，新 flow 可在 inferred primary 高压时尝试 standby。
 
 待做：
 
 - 更完整的跨机器连接池、QoS 检测和背压策略验证。
 - 结构化 metrics 导出（转发包数/字节数/丢包原因）。
-- 基于写延迟 EWMA 的安全切换阈值设计。
+- 基于真实压测结果调优写延迟 EWMA、critical latency 和 TCP flow idle timeout 阈值。
 - 配置热加载。
 
 验收：

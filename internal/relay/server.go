@@ -24,6 +24,8 @@ const (
 	relayTCPEnqueueWait  = 30 * time.Second
 	relayUDPEnqueueWait  = 10 * time.Millisecond
 	relayICMPEnqueueWait = 100 * time.Millisecond
+	relayQueueHighWater  = 0.8
+	relayFlowIdleTimeout = 2 * time.Minute
 )
 
 // client represents a connected client.
@@ -39,14 +41,20 @@ type client struct {
 	done       chan struct{}
 }
 
+type tcpFlowBinding struct {
+	target *client
+	lastAt time.Time
+}
+
 // Server is the WebSocket relay server.
 type Server struct {
 	cfg       *config.ServerConfig
 	allocator *VIPAllocator
 
-	mu      sync.RWMutex
-	clients map[string][]*client     // UUID -> connections
-	vipMap  map[netip.Addr][]*client // VIP -> connections
+	mu       sync.RWMutex
+	clients  map[string][]*client     // UUID -> connections
+	vipMap   map[netip.Addr][]*client // VIP -> connections
+	tcpFlows map[packet.TCPFlowKey]tcpFlowBinding
 
 	overlayCIDR *net.IPNet // pre-parsed for fast matching
 
@@ -75,6 +83,7 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 		allocator:   alloc,
 		clients:     make(map[string][]*client),
 		vipMap:      make(map[netip.Addr][]*client),
+		tcpFlows:    make(map[packet.TCPFlowKey]tcpFlowBinding),
 		overlayCIDR: cidr,
 		log:         logger.Logger.With().Str("component", "relay").Logger(),
 	}, nil
@@ -267,6 +276,7 @@ func (s *Server) unregisterClient(c *client) {
 	if len(s.vipMap[c.VirtualIP]) == 0 {
 		delete(s.vipMap, c.VirtualIP)
 	}
+	s.removeTCPFlowsForClientLocked(c)
 
 	s.log.Info().
 		Str("uuid", c.UUID).
@@ -319,6 +329,7 @@ func (s *Server) serverHeartbeat(ctx context.Context, c *client) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			s.expireTCPFlows()
 			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			c.writeMu.Lock()
 			err := c.Conn.Ping(pingCtx)
@@ -421,7 +432,7 @@ func (s *Server) forwardPacket(ctx context.Context, from *client, pkt *packet.Pa
 func (s *Server) enqueueOverlay(ctx context.Context, conns []*client, pkt *packet.Packet, raw []byte) bool {
 	switch pkt.Class() {
 	case packet.TrafficTCP:
-		return s.enqueueTCP(ctx, conns, raw)
+		return s.enqueueTCP(ctx, conns, pkt, raw)
 	case packet.TrafficUDP:
 		return s.enqueueUDP(ctx, conns, raw)
 	case packet.TrafficICMP, packet.TrafficOther:
@@ -433,11 +444,30 @@ func (s *Server) enqueueOverlay(ctx context.Context, conns []*client, pkt *packe
 	}
 }
 
-func (s *Server) enqueueTCP(ctx context.Context, conns []*client, raw []byte) bool {
+func (s *Server) enqueueTCP(ctx context.Context, conns []*client, pkt *packet.Packet, raw []byte) bool {
+	tcp, err := pkt.TCPHeader()
+	if err != nil {
+		s.log.Debug().Err(err).Msg("tcp: invalid header")
+		return false
+	}
+
 	timer := time.NewTimer(relayTCPEnqueueWait)
 	defer timer.Stop()
 
 	for {
+		if target := s.boundTCPClient(tcp.Flow); target != nil {
+			ok, closed := enqueueTCPToClient(ctx, target, raw, timer.C)
+			if ok {
+				s.afterTCPEnqueue(tcp, target)
+				return true
+			}
+			if closed {
+				s.removeTCPFlow(tcp.Flow)
+				continue
+			}
+			return false
+		}
+
 		target := selectPrimary(conns)
 		if target == nil {
 			return false
@@ -446,17 +476,117 @@ func (s *Server) enqueueTCP(ctx context.Context, conns []*client, raw []byte) bo
 			continue
 		}
 
-		select {
-		case target.WriteCh <- raw:
+		if tcp.IsInitialSYN() && relayQueuePressure(target) {
+			if standby := selectBestStandby(conns, target); tryEnqueueRelay(standby, raw) {
+				s.afterTCPEnqueue(tcp, standby)
+				return true
+			}
+		}
+
+		ok, closed := enqueueTCPToClient(ctx, target, raw, timer.C)
+		if ok {
+			s.afterTCPEnqueue(tcp, target)
 			return true
-		case <-target.doneCh():
+		}
+		if closed {
 			continue
-		case <-ctx.Done():
-			return false
-		case <-timer.C:
-			return false
+		}
+		return false
+	}
+}
+
+func (s *Server) boundTCPClient(flow packet.TCPFlowKey) *client {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	binding, ok := s.tcpFlows[flow]
+	if !ok || binding.target == nil || binding.target.isClosed() {
+		return nil
+	}
+	return binding.target
+}
+
+func (s *Server) afterTCPEnqueue(tcp *packet.TCPHeader, target *client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.tcpFlows == nil {
+		s.tcpFlows = make(map[packet.TCPFlowKey]tcpFlowBinding)
+	}
+	if tcp.ClosesFlow() {
+		delete(s.tcpFlows, tcp.Flow)
+		return
+	}
+	s.tcpFlows[tcp.Flow] = tcpFlowBinding{
+		target: target,
+		lastAt: time.Now(),
+	}
+}
+
+func (s *Server) removeTCPFlow(flow packet.TCPFlowKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tcpFlows, flow)
+}
+
+func (s *Server) removeTCPFlowsForClientLocked(target *client) {
+	for flow, binding := range s.tcpFlows {
+		if binding.target == nil || binding.target == target {
+			delete(s.tcpFlows, flow)
 		}
 	}
+}
+
+func (s *Server) expireTCPFlows() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.tcpFlows) == 0 {
+		return
+	}
+	now := time.Now()
+	for flow, binding := range s.tcpFlows {
+		if binding.target == nil || binding.target.isClosed() || now.Sub(binding.lastAt) > relayFlowIdleTimeout {
+			delete(s.tcpFlows, flow)
+		}
+	}
+}
+
+func enqueueTCPToClient(ctx context.Context, target *client, raw []byte, timeout <-chan time.Time) (ok bool, closed bool) {
+	if target == nil || target.isClosed() {
+		return false, true
+	}
+	select {
+	case target.WriteCh <- raw:
+		return true, false
+	case <-target.doneCh():
+		return false, true
+	case <-ctx.Done():
+		return false, false
+	case <-timeout:
+		return false, false
+	}
+}
+
+func tryEnqueueRelay(target *client, raw []byte) bool {
+	if target == nil || target.isClosed() {
+		return false
+	}
+	select {
+	case target.WriteCh <- raw:
+		return true
+	case <-target.doneCh():
+		return false
+	default:
+		return false
+	}
+}
+
+func relayQueuePressure(target *client) bool {
+	if target == nil || cap(target.WriteCh) == 0 {
+		return false
+	}
+	return float64(len(target.WriteCh))/float64(cap(target.WriteCh)) >= relayQueueHighWater
 }
 
 func (s *Server) enqueueUDP(ctx context.Context, conns []*client, raw []byte) bool {

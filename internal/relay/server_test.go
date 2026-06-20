@@ -11,6 +11,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/Daofengql/tun-over-ws/internal/config"
+	"github.com/Daofengql/tun-over-ws/internal/packet"
 )
 
 func TestVIPAllocator(t *testing.T) {
@@ -76,6 +77,28 @@ func buildTestPacketWithProtocol(src, dst netip.Addr, protocol uint8) []byte {
 	pkt := buildTestPacket(src, dst)
 	pkt[9] = protocol
 	return pkt
+}
+
+func buildTestTCPPacket(src, dst netip.Addr, srcPort, dstPort uint16, flags uint8) (*packet.Packet, []byte) {
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], 40)
+	pkt[8] = 64
+	pkt[9] = packet.ProtocolTCP
+	s4 := src.As4()
+	d4 := dst.As4()
+	copy(pkt[12:16], s4[:])
+	copy(pkt[16:20], d4[:])
+	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
+	pkt[32] = 0x50
+	pkt[33] = flags
+
+	parsed, err := packet.ParseIPv4(pkt)
+	if err != nil {
+		panic(err)
+	}
+	return parsed, pkt
 }
 
 func newTestRelayClient(queueSize int) *client {
@@ -207,13 +230,20 @@ func TestServerEnqueueTCPWaitsForPrimaryQueue(t *testing.T) {
 	srv := &Server{}
 	primary := newTestRelayClient(1)
 	primary.WriteCh <- []byte("queued")
+	pkt, raw := buildTestTCPPacket(
+		netip.MustParseAddr("10.66.0.2"),
+		netip.MustParseAddr("10.66.0.3"),
+		1000,
+		443,
+		packet.TCPFlagSYN,
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	result := make(chan bool, 1)
 	go func() {
-		result <- srv.enqueueTCP(ctx, []*client{primary}, []byte("tcp"))
+		result <- srv.enqueueTCP(ctx, []*client{primary}, pkt, raw)
 	}()
 
 	select {
@@ -256,10 +286,17 @@ func TestServerEnqueueTCPRetriesStandbyWhenPrimaryCloses(t *testing.T) {
 	primary := newTestRelayClient(1)
 	standby := newTestRelayClient(1)
 	primary.WriteCh <- []byte("queued")
+	pkt, raw := buildTestTCPPacket(
+		netip.MustParseAddr("10.66.0.2"),
+		netip.MustParseAddr("10.66.0.3"),
+		1001,
+		443,
+		packet.TCPFlagACK,
+	)
 
 	result := make(chan bool, 1)
 	go func() {
-		result <- srv.enqueueTCP(context.Background(), []*client{primary, standby}, []byte("tcp"))
+		result <- srv.enqueueTCP(context.Background(), []*client{primary, standby}, pkt, raw)
 	}()
 
 	select {
@@ -279,8 +316,8 @@ func TestServerEnqueueTCPRetriesStandbyWhenPrimaryCloses(t *testing.T) {
 		t.Fatal("enqueueTCP did not retry standby after primary closed")
 	}
 
-	if got := string(<-standby.WriteCh); got != "tcp" {
-		t.Fatalf("standby packet: got %q want tcp", got)
+	if got := <-standby.WriteCh; string(got) != string(raw) {
+		t.Fatalf("standby packet mismatch")
 	}
 }
 
@@ -288,16 +325,83 @@ func TestServerEnqueueTCPDoesNotDuplicateAfterQueueAccepts(t *testing.T) {
 	srv := &Server{}
 	primary := newTestRelayClient(1)
 	standby := newTestRelayClient(1)
+	pkt, raw := buildTestTCPPacket(
+		netip.MustParseAddr("10.66.0.2"),
+		netip.MustParseAddr("10.66.0.3"),
+		1002,
+		443,
+		packet.TCPFlagSYN,
+	)
 
-	if ok := srv.enqueueTCP(context.Background(), []*client{primary, standby}, []byte("tcp")); !ok {
+	if ok := srv.enqueueTCP(context.Background(), []*client{primary, standby}, pkt, raw); !ok {
 		t.Fatal("enqueueTCP returned false")
 	}
 	primary.markClosed()
 
-	if got := string(<-primary.WriteCh); got != "tcp" {
-		t.Fatalf("primary packet: got %q want tcp", got)
+	if got := <-primary.WriteCh; string(got) != string(raw) {
+		t.Fatalf("primary packet mismatch")
 	}
 	if len(standby.WriteCh) != 0 {
 		t.Fatalf("standby queue length: got %d want 0", len(standby.WriteCh))
+	}
+}
+
+func TestServerEnqueueTCPNewFlowCanBurstToStandbyWhenPrimaryPressured(t *testing.T) {
+	srv := &Server{tcpFlows: make(map[packet.TCPFlowKey]tcpFlowBinding)}
+	primary := newTestRelayClient(1)
+	standby := newTestRelayClient(1)
+	primary.WriteCh <- []byte("queued")
+	pkt, raw := buildTestTCPPacket(
+		netip.MustParseAddr("10.66.0.2"),
+		netip.MustParseAddr("10.66.0.3"),
+		1003,
+		443,
+		packet.TCPFlagSYN,
+	)
+
+	if ok := srv.enqueueTCP(context.Background(), []*client{primary, standby}, pkt, raw); !ok {
+		t.Fatal("enqueueTCP returned false")
+	}
+	if len(primary.WriteCh) != 1 {
+		t.Fatalf("primary queue length: got %d want 1", len(primary.WriteCh))
+	}
+	if got := <-standby.WriteCh; string(got) != string(raw) {
+		t.Fatalf("standby packet mismatch")
+	}
+}
+
+func TestServerEnqueueTCPExistingFlowStaysBound(t *testing.T) {
+	srv := &Server{tcpFlows: make(map[packet.TCPFlowKey]tcpFlowBinding)}
+	primary := newTestRelayClient(2)
+	standby := newTestRelayClient(2)
+	primary.WriteCh <- []byte("queued")
+
+	synPkt, synRaw := buildTestTCPPacket(
+		netip.MustParseAddr("10.66.0.2"),
+		netip.MustParseAddr("10.66.0.3"),
+		1004,
+		443,
+		packet.TCPFlagSYN,
+	)
+	if ok := srv.enqueueTCP(context.Background(), []*client{primary, standby}, synPkt, synRaw); !ok {
+		t.Fatal("initial SYN enqueue returned false")
+	}
+	<-standby.WriteCh
+
+	ackPkt, ackRaw := buildTestTCPPacket(
+		netip.MustParseAddr("10.66.0.2"),
+		netip.MustParseAddr("10.66.0.3"),
+		1004,
+		443,
+		packet.TCPFlagACK,
+	)
+	if ok := srv.enqueueTCP(context.Background(), []*client{primary, standby}, ackPkt, ackRaw); !ok {
+		t.Fatal("existing flow enqueue returned false")
+	}
+	if len(primary.WriteCh) != 1 {
+		t.Fatalf("primary queue length: got %d want 1", len(primary.WriteCh))
+	}
+	if got := <-standby.WriteCh; string(got) != string(ackRaw) {
+		t.Fatalf("standby packet mismatch")
 	}
 }

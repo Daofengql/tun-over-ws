@@ -2,9 +2,12 @@ package conn
 
 import (
 	"context"
+	"encoding/binary"
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/Daofengql/tun-over-ws/internal/packet"
 )
 
 func newTestPooledConn(role connRole, queueSize int) *pooledConn {
@@ -19,18 +22,41 @@ func newTestPooledConn(role connRole, queueSize int) *pooledConn {
 	return pc
 }
 
+func newTestTCPPacket(srcPort, dstPort uint16, flags uint8) (*packet.Packet, []byte) {
+	raw := make([]byte, 40)
+	raw[0] = 0x45
+	binary.BigEndian.PutUint16(raw[2:4], uint16(len(raw)))
+	raw[8] = 64
+	raw[9] = packet.ProtocolTCP
+	src := netip.MustParseAddr("10.66.0.2").As4()
+	dst := netip.MustParseAddr("10.66.0.3").As4()
+	copy(raw[12:16], src[:])
+	copy(raw[16:20], dst[:])
+	binary.BigEndian.PutUint16(raw[20:22], srcPort)
+	binary.BigEndian.PutUint16(raw[22:24], dstPort)
+	raw[32] = 0x50
+	raw[33] = flags
+
+	pkt, err := packet.ParseIPv4(raw)
+	if err != nil {
+		panic(err)
+	}
+	return pkt, raw
+}
+
 func TestPoolEnqueueTCPBlocksOnPrimary(t *testing.T) {
 	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
 	primary := newTestPooledConn(rolePrimary, 1)
 	primary.writeCh <- []byte("queued")
 	p.conns = []*pooledConn{primary}
+	pkt, raw := newTestTCPPacket(1000, 443, packet.TCPFlagSYN)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	result := make(chan bool, 1)
 	go func() {
-		result <- p.enqueueTCP(ctx, []byte("tcp"))
+		result <- p.enqueueTCP(ctx, pkt, raw)
 	}()
 
 	select {
@@ -50,8 +76,8 @@ func TestPoolEnqueueTCPBlocksOnPrimary(t *testing.T) {
 		t.Fatal("enqueueTCP did not complete after queue space became available")
 	}
 
-	if got := string(<-primary.writeCh); got != "tcp" {
-		t.Fatalf("queued packet: got %q want tcp", got)
+	if got := <-primary.writeCh; string(got) != string(raw) {
+		t.Fatalf("queued packet mismatch")
 	}
 }
 
@@ -84,6 +110,50 @@ func TestPoolEnqueueUDPUsesStandbyWhenPrimaryFull(t *testing.T) {
 	}
 	if got := string(<-standby.writeCh); got != "udp" {
 		t.Fatalf("standby packet: got %q want udp", got)
+	}
+}
+
+func TestPoolEnqueueTCPNewFlowCanBurstToStandbyWhenPrimaryDegraded(t *testing.T) {
+	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	primary := newTestPooledConn(rolePrimary, 1)
+	standby := newTestPooledConn(roleStandby, 1)
+	primary.state.MarkDegraded("test")
+	p.conns = []*pooledConn{primary, standby}
+	pkt, raw := newTestTCPPacket(2000, 443, packet.TCPFlagSYN)
+
+	if ok := p.enqueueTCP(context.Background(), pkt, raw); !ok {
+		t.Fatal("enqueueTCP returned false")
+	}
+	if len(primary.writeCh) != 0 {
+		t.Fatalf("primary queue length: got %d want 0", len(primary.writeCh))
+	}
+	if got := <-standby.writeCh; string(got) != string(raw) {
+		t.Fatalf("standby packet mismatch")
+	}
+}
+
+func TestPoolEnqueueTCPExistingFlowStaysBound(t *testing.T) {
+	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	primary := newTestPooledConn(rolePrimary, 2)
+	standby := newTestPooledConn(roleStandby, 2)
+	primary.state.MarkDegraded("test")
+	p.conns = []*pooledConn{primary, standby}
+
+	synPkt, synRaw := newTestTCPPacket(2001, 443, packet.TCPFlagSYN)
+	if ok := p.enqueueTCP(context.Background(), synPkt, synRaw); !ok {
+		t.Fatal("initial SYN enqueue returned false")
+	}
+	<-standby.writeCh
+
+	ackPkt, ackRaw := newTestTCPPacket(2001, 443, packet.TCPFlagACK)
+	if ok := p.enqueueTCP(context.Background(), ackPkt, ackRaw); !ok {
+		t.Fatal("existing flow enqueue returned false")
+	}
+	if len(primary.writeCh) != 0 {
+		t.Fatalf("primary queue length: got %d want 0", len(primary.writeCh))
+	}
+	if got := <-standby.writeCh; string(got) != string(ackRaw) {
+		t.Fatalf("standby packet mismatch")
 	}
 }
 

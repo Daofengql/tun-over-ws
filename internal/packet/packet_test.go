@@ -109,3 +109,44 @@ func TestPacketClass(t *testing.T) {
 		})
 	}
 }
+
+func TestTCPHeader(t *testing.T) {
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], 40)
+	pkt[8] = 64
+	pkt[9] = ProtocolTCP
+	src := netip.MustParseAddr("10.66.0.2").As4()
+	dst := netip.MustParseAddr("10.66.0.3").As4()
+	copy(pkt[12:16], src[:])
+	copy(pkt[16:20], dst[:])
+	binary.BigEndian.PutUint16(pkt[20:22], 12345)
+	binary.BigEndian.PutUint16(pkt[22:24], 443)
+	pkt[32] = 0x50
+	pkt[33] = TCPFlagSYN
+
+	parsed, err := ParseIPv4(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcp, err := parsed.TCPHeader()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tcp.Flow.SrcAddr != netip.MustParseAddr("10.66.0.2") {
+		t.Fatalf("src addr: got %s", tcp.Flow.SrcAddr)
+	}
+	if tcp.Flow.DstAddr != netip.MustParseAddr("10.66.0.3") {
+		t.Fatalf("dst addr: got %s", tcp.Flow.DstAddr)
+	}
+	if tcp.Flow.SrcPort != 12345 {
+		t.Fatalf("src port: got %d want 12345", tcp.Flow.SrcPort)
+	}
+	if tcp.Flow.DstPort != 443 {
+		t.Fatalf("dst port: got %d want 443", tcp.Flow.DstPort)
+	}
+	if !tcp.IsInitialSYN() {
+		t.Fatal("expected initial SYN")
+	}
+}

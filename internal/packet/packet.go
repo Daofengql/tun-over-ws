@@ -8,10 +8,13 @@ import (
 )
 
 var (
-	ErrTooShort      = errors.New("packet too short for IPv4 header")
-	ErrNotIPv4       = errors.New("not an IPv4 packet")
-	ErrInvalidLength = errors.New("invalid IPv4 header length")
-	ErrTruncated     = errors.New("packet truncated (total length mismatch)")
+	ErrTooShort         = errors.New("packet too short for IPv4 header")
+	ErrNotIPv4          = errors.New("not an IPv4 packet")
+	ErrInvalidLength    = errors.New("invalid IPv4 header length")
+	ErrTruncated        = errors.New("packet truncated (total length mismatch)")
+	ErrNotTCP           = errors.New("not a TCP packet")
+	ErrTCPTooShort      = errors.New("packet too short for TCP header")
+	ErrInvalidTCPHeader = errors.New("invalid TCP header length")
 )
 
 // Packet represents a parsed IPv4 packet header.
@@ -31,6 +34,28 @@ const (
 	ProtocolUDP  = 17
 	ProtocolIGMP = 2
 )
+
+const (
+	TCPFlagFIN = 0x01
+	TCPFlagSYN = 0x02
+	TCPFlagRST = 0x04
+	TCPFlagACK = 0x10
+)
+
+// TCPFlowKey identifies one directional TCP flow.
+type TCPFlowKey struct {
+	SrcAddr netip.Addr
+	DstAddr netip.Addr
+	SrcPort uint16
+	DstPort uint16
+}
+
+// TCPHeader is the TCP metadata used by schedulers.
+type TCPHeader struct {
+	Flow       TCPFlowKey
+	DataOffset uint8
+	Flags      uint8
+}
 
 // TrafficClass describes the forwarding behavior a packet should use.
 type TrafficClass int
@@ -138,4 +163,47 @@ func (p *Packet) IsLimitedBroadcast() bool {
 	}
 	octets := p.DstAddr.As4()
 	return octets == [4]byte{255, 255, 255, 255}
+}
+
+// TCPHeader parses the TCP header carried by this IPv4 packet.
+func (p *Packet) TCPHeader() (*TCPHeader, error) {
+	if p.Protocol != ProtocolTCP {
+		return nil, ErrNotTCP
+	}
+
+	headerLen := int(p.IHL) * 4
+	if len(p.Raw) < headerLen+20 {
+		return nil, ErrTCPTooShort
+	}
+
+	tcp := p.Raw[headerLen:]
+	dataOffset := tcp[12] >> 4
+	if dataOffset < 5 {
+		return nil, fmt.Errorf("%w: data_offset=%d", ErrInvalidTCPHeader, dataOffset)
+	}
+	tcpHeaderLen := int(dataOffset) * 4
+	if len(tcp) < tcpHeaderLen {
+		return nil, fmt.Errorf("%w: header_len=%d actual=%d", ErrTCPTooShort, tcpHeaderLen, len(tcp))
+	}
+
+	return &TCPHeader{
+		Flow: TCPFlowKey{
+			SrcAddr: p.SrcAddr,
+			DstAddr: p.DstAddr,
+			SrcPort: binary.BigEndian.Uint16(tcp[0:2]),
+			DstPort: binary.BigEndian.Uint16(tcp[2:4]),
+		},
+		DataOffset: dataOffset,
+		Flags:      tcp[13],
+	}, nil
+}
+
+// IsInitialSYN reports whether this packet begins a new outbound TCP flow.
+func (h *TCPHeader) IsInitialSYN() bool {
+	return h != nil && h.Flags&TCPFlagSYN != 0 && h.Flags&TCPFlagACK == 0
+}
+
+// ClosesFlow reports whether this packet can retire a flow binding after enqueue.
+func (h *TCPHeader) ClosesFlow() bool {
+	return h != nil && h.Flags&(TCPFlagFIN|TCPFlagRST) != 0
 }

@@ -52,11 +52,15 @@ TCP uses backpressure-first behavior:
 - If the primary is healthy but slow, block on its write queue so the TUN read loop slows down.
 - Do not weighted-random individual TCP packets across all WebSockets.
 - Avoid moving packets from an existing TCP flow between WebSockets unless the primary has failed. Packet reordering is more damaging than waiting.
+- When the primary is degraded or under sustained queue pressure, new TCP flows may use a standby as burst capacity while existing flows stay on their bound WebSocket.
 - On primary failure, promote a standby and resume through the new primary. Inner TCP may retransmit lost packets naturally.
 
-Future optional improvement:
+Implemented flow binding:
 
-- Track a lightweight flow table so new TCP flows can be assigned to a burst standby while old flows remain on the primary. This is optional and should not be required for the first revised implementation.
+- Track a lightweight TCP flow table keyed by source/destination IP and port.
+- Initial SYN packets create a flow binding.
+- FIN/RST packets and idle timeout remove the binding.
+- Existing flow packets use their bound connection instead of being redistributed per packet.
 
 ### UDP
 
@@ -148,7 +152,9 @@ parse IPv4 header
 classify traffic
 
 TCP:
-  enqueue to primary with blocking semantics
+  existing flow: enqueue to bound connection
+  new flow: enqueue to primary with blocking semantics
+  if primary degraded or under pressure, new flow may try standby non-blocking first
   if primary dead, promote standby and retry
   if context canceled, stop
 
@@ -180,6 +186,7 @@ bounded queues
 blocking TCP enqueue
 lossy UDP enqueue
 primary/standby promotion
+lightweight TCP flow binding
 ```
 
 ## Server Data Path
@@ -282,6 +289,8 @@ Tasks:
 
 - Replace weighted random packet dispatch with traffic-class dispatch.
 - TCP enqueue blocks on the primary write queue.
+- Existing TCP flows stay on their bound WebSocket.
+- New TCP flows can burst to standby when the primary is degraded or under queue pressure.
 - UDP enqueue is non-blocking or short-wait and may use standby.
 - ICMP enqueue short-waits.
 - Multicast/broadcast gets dropped or deprioritized.
@@ -340,6 +349,7 @@ Tests to add or update:
 - Server forwarding does not immediately drop TCP on full target queue. ✅
 - Server TCP forwarding retries a standby if the inferred primary closes while a sender is waiting. ✅
 - Queue acceptance is treated as successful enqueue to avoid duplicate packet injection during close races. ✅
+- TCP flow binding keeps existing flows on one WebSocket while allowing new degraded-primary flows to burst to standby. ✅
 - Connection-state counters, timestamps, queue snapshots, and write latency EWMA are covered by unit tests. ✅
 - Existing unit tests pass. ✅
 

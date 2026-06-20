@@ -35,6 +35,7 @@ const (
 	latencyHighSamples   = 3
 	criticalWriteLatency = 5 * time.Second
 	latencyCriticalTicks = 3
+	flowIdleTimeout      = 2 * time.Minute
 )
 
 type connRole string
@@ -60,11 +61,17 @@ type pooledConn struct {
 	done      chan struct{}
 }
 
+type tcpFlowBinding struct {
+	conn   *pooledConn
+	lastAt time.Time
+}
+
 // Pool manages multiple WebSocket connections with QoS-aware routing.
 type Pool struct {
 	mu         sync.RWMutex
 	tunWriteMu sync.Mutex
 	conns      []*pooledConn
+	tcpFlows   map[packet.TCPFlowKey]tcpFlowBinding
 
 	serverURL string
 	uuid      string
@@ -75,7 +82,7 @@ type Pool struct {
 	tunDev    *tun.Device
 	virtualIP netip.Addr
 
-	maxTotal      int
+	maxTotal             int
 	pendingBuilds        int
 	timeoutDetect        *TimeoutDetector
 	pressureTicks        int
@@ -101,6 +108,7 @@ func NewPool(serverURL, uuid, token, tunName string, mtu int) *Pool {
 		mtu:           mtu,
 		maxTotal:      defaultMaxTotal,
 		timeoutDetect: NewTimeoutDetector(0),
+		tcpFlows:      make(map[packet.TCPFlowKey]tcpFlowBinding),
 		log:           logger.Logger.With().Str("component", "pool").Logger(),
 	}
 }
@@ -250,7 +258,7 @@ func (p *Pool) tunToPool(ctx context.Context) {
 func (p *Pool) dispatchPacket(ctx context.Context, pkt *packet.Packet, raw []byte) bool {
 	switch pkt.Class() {
 	case packet.TrafficTCP:
-		return p.enqueueTCP(ctx, raw)
+		return p.enqueueTCP(ctx, pkt, raw)
 	case packet.TrafficUDP:
 		return p.enqueueUDP(ctx, raw)
 	case packet.TrafficICMP, packet.TrafficOther:
@@ -262,15 +270,43 @@ func (p *Pool) dispatchPacket(ctx context.Context, pkt *packet.Packet, raw []byt
 	}
 }
 
-func (p *Pool) enqueueTCP(ctx context.Context, raw []byte) bool {
+func (p *Pool) enqueueTCP(ctx context.Context, pkt *packet.Packet, raw []byte) bool {
+	tcp, err := pkt.TCPHeader()
+	if err != nil {
+		p.log.Debug().Err(err).Msg("tcp: invalid header")
+		return false
+	}
+
 	for ctx.Err() == nil {
+		if pc := p.boundTCPConn(tcp.Flow); pc != nil {
+			ok, closed := pc.enqueue(ctx, raw)
+			if ok {
+				p.afterTCPEnqueue(tcp, pc)
+				return true
+			}
+			if closed {
+				p.removeTCPFlow(tcp.Flow)
+				continue
+			}
+			return false
+		}
+
 		pc := p.primaryOrWait(ctx)
 		if pc == nil {
 			return false
 		}
+		if tcp.IsInitialSYN() {
+			if burst := p.tcpBurstStandby(); burst != nil {
+				if ok := burst.tryEnqueue(raw); ok {
+					p.afterTCPEnqueue(tcp, burst)
+					return true
+				}
+			}
+		}
 
 		ok, closed := pc.enqueue(ctx, raw)
 		if ok {
+			p.afterTCPEnqueue(tcp, pc)
 			return true
 		}
 		if closed {
@@ -304,6 +340,74 @@ func (p *Pool) enqueuePrimaryWithTimeout(ctx context.Context, raw []byte, timeou
 	}
 
 	return pc.enqueueWithTimeout(ctx, raw, timeout)
+}
+
+func (p *Pool) boundTCPConn(flow packet.TCPFlowKey) *pooledConn {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	binding, ok := p.tcpFlows[flow]
+	if !ok || binding.conn == nil || !binding.conn.isAlive() || binding.conn.role == roleDraining {
+		return nil
+	}
+	return binding.conn
+}
+
+func (p *Pool) afterTCPEnqueue(tcp *packet.TCPHeader, pc *pooledConn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.tcpFlows == nil {
+		p.tcpFlows = make(map[packet.TCPFlowKey]tcpFlowBinding)
+	}
+	if tcp.ClosesFlow() {
+		delete(p.tcpFlows, tcp.Flow)
+		return
+	}
+	p.tcpFlows[tcp.Flow] = tcpFlowBinding{
+		conn:   pc,
+		lastAt: time.Now(),
+	}
+}
+
+func (p *Pool) removeTCPFlow(flow packet.TCPFlowKey) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.tcpFlows, flow)
+}
+
+func (p *Pool) tcpBurstStandby() *pooledConn {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	primary := p.primaryLocked()
+	if primary == nil || !p.primaryAllowsTCPBurstLocked(primary) {
+		return nil
+	}
+
+	var best *pooledConn
+	bestAvail := -1
+	for _, pc := range p.conns {
+		if pc.role != roleStandby || !pc.isAlive() {
+			continue
+		}
+		avail := cap(pc.writeCh) - len(pc.writeCh)
+		if avail > bestAvail {
+			best = pc
+			bestAvail = avail
+		}
+	}
+	return best
+}
+
+func (p *Pool) primaryAllowsTCPBurstLocked(primary *pooledConn) bool {
+	if primary == nil || primary.state.IsDegraded() {
+		return primary != nil
+	}
+	if cap(primary.writeCh) == 0 {
+		return false
+	}
+	return float64(len(primary.writeCh))/float64(cap(primary.writeCh)) >= queueHighWatermark
 }
 
 // readConn reads from a single connection and writes to TUN.
@@ -794,6 +898,7 @@ func (p *Pool) closeAll() {
 		pc.close()
 	}
 	p.conns = nil
+	p.tcpFlows = make(map[packet.TCPFlowKey]tcpFlowBinding)
 }
 
 // stateUpdater periodically updates all connection states.
@@ -812,6 +917,22 @@ func (p *Pool) stateUpdater(ctx context.Context) {
 				pc.state.Update()
 			}
 			p.mu.RUnlock()
+			p.expireTCPFlows()
+		}
+	}
+}
+
+func (p *Pool) expireTCPFlows() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.tcpFlows) == 0 {
+		return
+	}
+	now := time.Now()
+	for flow, binding := range p.tcpFlows {
+		if binding.conn == nil || !binding.conn.isAlive() || binding.conn.role == roleDraining || now.Sub(binding.lastAt) > flowIdleTimeout {
+			delete(p.tcpFlows, flow)
 		}
 	}
 }
