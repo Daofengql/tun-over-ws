@@ -7,11 +7,10 @@ import (
 )
 
 const (
-	maxSamples        = 5
-	clusterTolerance  = 5 * time.Second
+	maxSamples         = 5
+	clusterTolerance   = 5 * time.Second
 	minSamplesToDetect = 3
-	rotationRatio     = 0.8
-	defaultRotation   = 50 * time.Second
+	rotationRatio      = 0.8
 )
 
 // TimeoutDetector auto-detects CDN/nginx connection time limits.
@@ -46,18 +45,20 @@ func (td *TimeoutDetector) RecordDisconnect(aliveDuration time.Duration) {
 	td.tryDetect()
 }
 
-// GetRotationInterval returns how long to wait before proactively rotating.
-func (td *TimeoutDetector) GetRotationInterval() time.Duration {
+// RotationInterval returns how long to wait before proactively rotating.
+// The bool is false until the interval is explicitly configured or a stable
+// remote timeout has been detected.
+func (td *TimeoutDetector) RotationInterval() (time.Duration, bool) {
 	td.mu.Lock()
 	defer td.mu.Unlock()
 
 	if td.configured > 0 {
-		return td.configured
+		return td.configured, true
 	}
 	if td.detected > 0 {
-		return time.Duration(float64(td.detected) * rotationRatio)
+		return time.Duration(float64(td.detected) * rotationRatio), true
 	}
-	return defaultRotation
+	return 0, false
 }
 
 // IsDetected returns whether a timeout limit has been auto-detected.

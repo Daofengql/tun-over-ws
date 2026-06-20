@@ -1,19 +1,20 @@
-# CLAUDE.md
+# Claude 接手说明
 
-## Project
+## 项目定位
 
-`wsvpn` is a centralized WebSocket L3 VPN in Go. Clients create TUN interfaces and send raw IPv4 packets to a relay server over WebSocket.
+`tun-over-ws` 是一个 Go 单二进制三层 overlay 组网工具。客户端通过 TUN 捕获原始 IPv4 包，并通过 WebSocket 连接中心服务端；服务端按虚拟 IP 转发包。
 
-Current scope:
+当前范围：
 
-- Overlay client-to-client forwarding is implemented and tested on Windows/Linux.
-- Exit mode is not implemented.
-- UUID/token auth is test-stage only and will be replaced by server-signed login later.
+- overlay 客户端互通已经实现，并在 Windows/Linux 之间验证。
+- WebSocket 连接池已经改为固定大小 primary/standby 模型。
+- exit gateway 尚未实现。
+- UUID/token 只是开发测试身份字段，后续会替换为服务端签名登录。
 
-## Build & Test
+## 构建和测试
 
 ```powershell
-go test ./...
+go test -timeout 60s ./...
 go vet ./...
 go build -o .\bin\wsvpn.exe .\cmd\wsvpn
 
@@ -24,59 +25,64 @@ Remove-Item Env:\GOOS
 Remove-Item Env:\GOARCH
 ```
 
-Do not commit `bin/`, binaries, or `wintun.dll`.
+不要提交 `bin/`、二进制、`wintun.dll`、日志、`configs/` 或 `testdata/`。
 
-## Run (local Windows test, requires admin PowerShell)
+## 本地 Windows 运行
+
+需要管理员 PowerShell：
 
 ```powershell
-# Terminal 1: server
+# 终端 1：服务端
 .\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
 
-# Terminal 2: client A, usually 10.66.0.2
+# 终端 2：客户端 A，通常拿到 10.66.0.2
 .\bin\wsvpn.exe client -c .\configs\local\client-a.yaml --log-level debug
 
-# Terminal 3: client B, usually 10.66.0.3
+# 终端 3：客户端 B，通常拿到 10.66.0.3
 .\bin\wsvpn.exe client -c .\configs\local\client-b.yaml --log-level debug
 
-# Terminal 4: test
+# 终端 4：指定源地址测试
 ping -S 10.66.0.2 10.66.0.3
 ```
 
-## Architecture
+## 模块划分
 
-- `cmd/wsvpn/` - Cobra CLI entry (server/client subcommands)
-- `internal/packet/` - IPv4 header parsing and validation
-- `internal/config/` - YAML config loading and validation
-- `internal/relay/` - Server-side WebSocket relay, VIP allocator, source validation, forwarding
-- `internal/conn/` - Client-side connection pool, QoS detection, congestion control, TUN pump
-- `internal/tun/` - TUN device wrapper (wireguard-go), platform-specific IP setup
-- `internal/logger/` - Colored terminal logger (zerolog)
+- `cmd/wsvpn/`：Cobra CLI 入口，提供 `server` 和 `client` 子命令。
+- `internal/config/`：YAML 配置加载和校验。
+- `internal/packet/`：IPv4 包解析和 TCP/UDP/ICMP/噪声分类。
+- `internal/relay/`：服务端 WebSocket relay、VIP 分配、source 校验、primary/standby aware 转发。
+- `internal/conn/`：客户端连接池、心跳、自动重连、背压、TUN 数据泵。
+- `internal/tun/`：TUN 设备封装和平台 IP 配置。
+- `internal/logger/`：zerolog 彩色终端日志。
 
-## Key Decisions
+## 关键设计
 
-- Server: Linux-only target.
-- Client: Windows + Linux.
-- VIP allocation: server-issued (DHCP-like), client identified by UUID.
-- WebSocket: `github.com/coder/websocket`, with 30s heartbeat ping and auto-reconnect.
-- Connection pool: multi-conn per UUID, weighted routing, QoS detection, congestion control.
-- TUN: `golang.zx2c4.com/wireguard/tun`.
-- Windows requires `wintun.dll` next to the binary.
-- Linux TUN read/write uses 16-byte packet offset/headroom.
-- Binary output goes to `bin/`.
-- Overlay-only for now. Exit mode is a future phase.
-- TLS is expected to be handled by reverse proxy for MVP.
+- 服务端目标平台是 Linux。
+- 客户端支持 Windows 和 Linux。
+- VIP 由服务端统一分配，客户端不能自报虚拟 IP。
+- WebSocket 使用 `github.com/coder/websocket`，每条连接独立心跳。
+- 连接池是固定大小：一条 primary 承载常规流量，多条 standby 用于热备、突发和切换。
+- TCP 使用 flow 绑定和有界队列背压，不再在热路径中用令牌桶随意丢 TCP 包。
+- UDP 可复用 WebSocket 池，但策略是短等待、突发或丢弃，不阻塞 TCP。
+- Windows 运行需要 `wintun.dll` 与二进制同目录。
+- Linux TUN 读写使用 16 字节 packet offset/headroom。
+- TLS 在 MVP 中建议由反向代理终止。
 
-## Conventions
+## 已验证
 
-- Go code in `cmd/` and `internal/` only. No `.go` files in root.
-- Platform-specific code uses `_windows.go` / `_linux.go` suffixes.
-- Config files stay local under `configs/` or `testdata/`; do not commit them.
-- Keep docs honest about what has been tested versus what is planned.
+- `go test -timeout 60s ./...` 通过。
+- Windows/Linux 二进制构建通过。
+- Windows 单机双客户端 overlay ping 通过。
+- Linux 服务端 + Linux 客户端 + Windows 客户端 overlay ping 通过。
+- `iperf3` UDP 1M/5M 双向 0% 丢包。
+- `iperf3` TCP 双向可通，但 Linux -> Windows 方向吞吐低且重传多。
+- 修复后，压测期间没有再出现无故 primary 轮换、standby 空闲读超时导致的误判重连。
 
-## Known Edges
+## 已知边界
 
-- IPv6 packets are dropped with debug logs.
-- `routes.exit.enabled` does not configure exit routes yet.
-- Server TUN and NAT path are not implemented.
-- Auth is not production-grade.
-- `--send-to` is a placeholder.
+- IPv6 包当前丢弃。
+- `routes.exit.enabled` 不会配置默认路由。
+- server TUN、NAT、exit 数据路径未实现。
+- 认证不是生产级。
+- `--send-to` 是占位参数。
+- 不要在公开文档中写入远端 IP、账号、token 或临时测试 URL。

@@ -10,14 +10,16 @@ import (
 	"github.com/Daofengql/tun-over-ws/internal/packet"
 )
 
+const testRotationInterval = 50 * time.Second
+
 func newTestPooledConn(role connRole, queueSize int) *pooledConn {
 	pc := &pooledConn{
 		state:   NewConnState(),
 		writeCh: make(chan []byte, queueSize),
 		vip:     netip.MustParseAddr("10.66.0.2"),
-		role:    role,
 		done:    make(chan struct{}),
 	}
+	pc.setRole(role)
 	pc.alive.Store(true)
 	return pc
 }
@@ -239,9 +241,10 @@ func TestPoolRotatePrimaryPromotesStandby(t *testing.T) {
 func TestPoolMonitorRotatesPrimaryAtTimeoutThreshold(t *testing.T) {
 	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
 	p.maxTotal = 2
+	p.timeoutDetect = NewTimeoutDetector(testRotationInterval)
 	primary := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)
-	primary.state.createdAt = time.Now().Add(-defaultRotation - time.Second)
+	primary.primarySince = time.Now().Add(-testRotationInterval - time.Second)
 	p.conns = []*pooledConn{primary, standby}
 
 	p.monitorTick(context.Background())
@@ -251,6 +254,65 @@ func TestPoolMonitorRotatesPrimaryAtTimeoutThreshold(t *testing.T) {
 	}
 	if primary.role != roleDraining {
 		t.Fatalf("old primary role: got %s want %s", primary.role, roleDraining)
+	}
+	if !primary.plannedClose.Load() {
+		t.Fatal("old primary should be marked as planned close")
+	}
+}
+
+func TestPoolMonitorDoesNotRotateNewPrimaryByConnectionAge(t *testing.T) {
+	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p.maxTotal = 2
+	p.timeoutDetect = NewTimeoutDetector(testRotationInterval)
+	primary := newTestPooledConn(rolePrimary, 1)
+	standby := newTestPooledConn(roleStandby, 1)
+	primary.state.createdAt = time.Now().Add(-testRotationInterval - time.Second)
+	primary.primarySince = time.Now()
+	p.conns = []*pooledConn{primary, standby}
+
+	p.monitorTick(context.Background())
+
+	if primary.role != rolePrimary {
+		t.Fatalf("primary role: got %s want %s", primary.role, rolePrimary)
+	}
+	if standby.role != roleStandby {
+		t.Fatalf("standby role: got %s want %s", standby.role, roleStandby)
+	}
+	if p.pendingBuilds != 0 {
+		t.Fatalf("pendingBuilds: got %d want 0", p.pendingBuilds)
+	}
+}
+
+func TestPoolMonitorIgnoresPlannedCloseForTimeoutDetection(t *testing.T) {
+	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	pc := newTestPooledConn(roleDraining, 1)
+	pc.state.createdAt = time.Now().Add(-2 * testRotationInterval)
+	pc.plannedClose.Store(true)
+	pc.close()
+	p.conns = []*pooledConn{pc}
+
+	p.monitorTick(context.Background())
+
+	if p.timeoutDetect.IsDetected() {
+		t.Fatal("planned close should not feed timeout detector")
+	}
+}
+
+func TestPoolMonitorDoesNotRotateWithoutDetectedTimeout(t *testing.T) {
+	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p.maxTotal = 2
+	primary := newTestPooledConn(rolePrimary, 1)
+	standby := newTestPooledConn(roleStandby, 1)
+	primary.primarySince = time.Now().Add(-2 * testRotationInterval)
+	p.conns = []*pooledConn{primary, standby}
+
+	p.monitorTick(context.Background())
+
+	if primary.role != rolePrimary {
+		t.Fatalf("primary role: got %s want %s", primary.role, rolePrimary)
+	}
+	if standby.role != roleStandby {
+		t.Fatalf("standby role: got %s want %s", standby.role, roleStandby)
 	}
 }
 

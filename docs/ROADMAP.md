@@ -1,166 +1,138 @@
 # 开发路线
 
+路线图只保留当前仍有指导价值的阶段状态。已经完成并通过测试的连接池详细计划已经归档到架构和交接文档，不再保留独立计划文件。
+
 ## 阶段 0：项目基础
 
-目标：只搭框架和说明，不写网络功能。
+状态：已完成。
 
-**已完成。**
-
-- 创建项目目录。
-- 约定单二进制、多角色。
-- 约定代码不堆在根目录。
-- 写明 overlay 和 exit 两条数据路径。
-- 写明 MVP 和风险。
+- 单二进制、多角色：`wsvpn server` / `wsvpn client`。
+- Go 代码放在 `cmd/` 和 `internal/`，根目录不堆 `.go` 文件。
+- 明确两条长期数据路径：overlay 内网和服务端出口。
+- 建立 README、架构、运维、路线和交接文档。
 
 ## 阶段 1：包解析和配置
 
-目标：建立可以测试的小模块。
+状态：已完成并有单元测试。
 
-**已完成。**
+- YAML 配置解析和默认值。
+- overlay CIDR、服务端地址、MTU、token 基础校验。
+- IPv4 包头解析。
+- source、destination、protocol 提取。
+- 短包、非 IPv4、错误 IHL、错误 total length 校验。
+- TCP、UDP、ICMP、组播、广播和噪声流量分类。
 
-- 定义 YAML 配置格式。
-- 解析 overlay CIDR、服务端地址、MTU、token。
-- 配置校验要求 overlay 和 server TUN IP 为 IPv4。
-- 配置校验要求 server TUN IP 位于 overlay CIDR 内。
-- 实现 IPv4 包头解析。
-- 从 IP 包中提取 source、destination、protocol。
-- 对短包、非 IPv4 包、错误 header length、total length 做校验。
-- 单元测试覆盖正常和 malformed 包。
+## 阶段 2：WebSocket Relay 原型
 
-## 阶段 2：WebSocket relay 原型
-
-目标：先不接 TUN，用模拟 IP 包验证服务端转发表。
-
-**已完成。**
+状态：已完成并有端到端单元测试。
 
 - 服务端接受 WebSocket 连接。
-- 客户端发送 hello 注册，服务端分配虚拟 IP（DHCP 模式）。
-- 服务端维护 `virtual_ip -> client` 映射。
-- 服务端解析 packet destination。
-- 服务端校验 packet source 必须等于连接分配的 VIP。
+- 客户端 hello 注册。
+- 服务端动态分配虚拟 IP。
+- 维护 `virtual_ip -> client connections` 映射。
+- 校验 packet source 必须等于连接分配的 VIP。
 - overlay 命中时转发给目标客户端。
-- 未命中时丢弃并记录原因。
-- 端到端测试：两个模拟客户端通过 relay 互发包成功。
+- 未命中或非 overlay 流量按当前策略丢弃。
 
-## 阶段 3：客户端 TUN MVP
+## 阶段 3：真实 TUN 客户端
 
-目标：实现真实客户端组网。
+状态：已完成并通过 Windows/Linux overlay 测试。
 
-**已完成（Windows + Linux overlay）。**
-
-- 客户端创建 TUN（wireguard-go + Wintun/Linux TUN）。
-- Windows 配置虚拟 IP（`netsh`，不修改系统默认路由）。
-- Linux 配置虚拟 IP（`ip addr add` + `ip link set up`，不修改默认路由）。
+- Windows 客户端：Wintun + `netsh` 配置虚拟 IP。
+- Linux 客户端：`/dev/net/tun` + `ip addr` / `ip link` 配置接口。
 - TUN -> WebSocket 数据泵。
 - WebSocket -> TUN 数据泵。
-- Linux TUN read/write 使用 `tunPacketOffset = 16`，修复 wireguard-go 后端的 offset 要求。
-- Windows 单机两客户端互 ping 验证通过：`ping -S 10.66.0.2 10.66.0.3`。
-- Linux/Windows overlay 验证通过。
-- `wintun.dll` 需放在 Windows 二进制同目录。
+- Linux TUN 使用 `tunPacketOffset = 16`，修复 wireguard-go 后端 headroom 要求。
+- Windows 单机双客户端 overlay ping 通过。
+- Linux 服务端 + Linux 客户端 + Windows 客户端 overlay ping 通过。
 
-待做：
+仍需改进：
 
-- 优雅退出时更完整地清理路由和 TUN 设备。
-- 将跨平台 overlay 测试流程沉淀为可重复脚本。
-- 增加 TUN 平台层的错误提示和诊断。
+- 异常退出后的 TUN/路由清理更完整。
+- 平台层失败提示和诊断信息更友好。
 
-## 阶段 4：服务端出口
+## 阶段 4：连接池和稳定性
 
-目标：让服务端成为 egress gateway。
-
-**未开始。**
-
-任务：
-
-- 服务端创建 TUN，使用 `10.66.0.1/24`。
-- 服务端读取 TUN 回包并转发给客户端。
-- 客户端支持 exit mode 路由配置。
-- 文档化 Linux `ip_forward` 和 NAT 配置。
-- 服务端按客户端权限控制是否允许 exit。
-- 确保 WebSocket 服务端公网 IP 不被默认路由送进隧道。
-
-验收：
-
-- 客户端启用 exit 后能访问公网 IP。
-- 客户端访问服务端 WebSocket 的连接不被隧道吞掉。
-- 禁用 exit 的客户端无法把非 overlay 流量发出。
-
-## 阶段 5：稳定性
-
-目标：让 MVP 可持续运行。
-
-**部分完成。**
+状态：核心实现已完成，并通过单元测试与跨平台基础压测。
 
 已完成：
 
-- 心跳（30s WebSocket Ping，每连接独立）。
-- 连接池：固定大小 WS 池，单 primary + 多 standby，自动补建和轮换。
-- TCP 背压：TCP flow 绑定到单条 WebSocket；已有 flow 不跨连接乱序，新 flow 可在 primary 退化/高压时尝试 standby，队列满时阻塞 TUN 读取路径，不再用令牌桶主动丢 TCP。
-- UDP 独立策略：primary 满时可尝试 standby，仍不可用则快速丢弃。
-- QoS 检测：单连接吞吐追踪，动态 peak，作为观测信号保留。
-- 连接状态指标：读写字节、最后读写时间、写延迟 EWMA、队列深度快照。
-- 超时探测：被动学习 CDN 连接时长限制，主动轮换。
-- VIP 跨连接保持（UUID 绑定，进程内存级别）。
-- 写队列 512 缓冲，TCP 满时等待，UDP/ICMP/噪声按策略短等待或丢弃。
-- buffer pool 减少 TUN read GC 压力。
-- 多 readConn 写 TUN 时通过 tunWriteMu 串行化。
-- 服务端连接生命周期受根 context 控制，服务端退出时能推动连接关闭。
-- 服务端 overlay 转发按 TCP/UDP/ICMP 分类处理，避免 TCP 目标队列满时立即丢包。
-- 服务端 overlay 转发维护 TCP flow 绑定，已有 flow 固定到同一目标连接，新 flow 可在 inferred primary 高压时尝试 standby。
+- 固定大小 WebSocket 连接池。
+- 正常状态下单 primary 承载主要流量，多 standby 热连接。
+- primary 断开后提升 standby，并后台补建。
+- TCP flow 绑定：已有 flow 保持在同一 WebSocket，避免跨连接乱序。
+- TCP 背压：队列满时阻塞 TUN 读取路径，不再用令牌桶在热路径中主动丢 TCP。
+- primary 退化或队列高压时，新 TCP flow 可尝试 standby 突发。
+- UDP 可尝试 standby，仍不可用则快速丢弃。
+- ICMP 短等待，组播/广播/IGMP 噪声过滤。
+- QoS 观测：吞吐、写延迟 EWMA、读写字节、最后读写时间、队列深度。
+- CDN/nginx 连接寿命探测和计划轮换。
+- 计划内 draining/rotation 关闭不会参与超时学习。
+- 服务端侧按目标 VIP 的连接池转发，TCP 保持 flow 绑定，UDP 可突发或丢弃。
 
-待做：
+已验证：
 
-- 更完整的跨机器连接池、QoS 检测和背压策略验证。
-- 结构化 metrics 导出（转发包数/字节数/丢包原因）。
-- 基于真实压测结果调优写延迟 EWMA、critical latency 和 TCP flow idle timeout 阈值。
-- 配置热加载。
+- `go test -timeout 60s ./...` 通过。
+- Windows/Linux 二进制构建通过。
+- 跨平台 overlay ping 通过。
+- `iperf3` UDP 1M/5M 双向 0% 丢包。
+- `iperf3` TCP 双向可通。
+- 修复后未再观察到 standby 空闲读超时导致的假超时探测和无故轮换。
+
+仍需改进：
+
+- Linux -> Windows TCP 方向吞吐低、重传多，需要重点查 Windows TUN MTU、写入路径、分片和 TCP MSS。
+- 日志中的包字节数字段目前可读性不足，需要修正输出格式。
+- 根据更多本地低延迟测试结果调整写延迟阈值、critical latency、flow idle timeout。
+- 增加结构化 metrics：连接数、转发包/字节数、丢包原因、重连和轮换次数。
+
+## 阶段 5：服务端出口
+
+状态：未开始。
+
+目标：
+
+- 服务端创建 server TUN，使用 `10.66.0.1/24`。
+- 服务端读取 TUN 回包并转发给客户端。
+- Linux 开启 IP forwarding，并配置 NAT。
+- 客户端支持 exit mode 路由配置。
+- 确保到 WebSocket 服务端公网地址的真实路由不被隧道吞掉。
+- 服务端按权限控制哪些客户端可以使用 exit。
 
 验收：
 
-- 服务端重启后客户端能重连。
-- 网络短断后能恢复。
-- 同 UUID 频繁重连不会破坏最新连接的 VIP 映射。
+- 客户端启用 exit 后能访问公网。
+- 禁用 exit 的客户端无法发送非 overlay 流量。
+- WebSocket 控制连接不会被自己的默认路由送回隧道。
 
 ## 阶段 6：安全增强
 
-目标：降低真实部署风险。
+状态：未开始。
 
-**未开始。**
+目标：
 
-任务：
+- 用服务端签名登录、节点密钥或证书替换测试 token。
+- 持久化节点身份和虚拟 IP。
+- ACL 和审计日志。
+- 限制客户端速率、连接频率和可访问目标。
+- 限制 exit 权限。
 
-- token 改为节点密钥、证书或服务端签名登录。
-- 服务端持久化节点身份和虚拟 IP。
-- ACL。
-- 审计日志。
-- 限制客户端可宣告路由。
-- 限制客户端速率和连接频率。
+当前已有安全基础：
 
-已完成的安全基础：
-
-- 虚拟 IP 由服务端统一分配。
-- 服务端检查客户端发来的 packet source IP 是否等于该连接分配的 VIP。
-- 同一 UUID 可保留多条连接，但共享同一个服务端分配的 VIP。
-
-验收：
-
-- 客户端不能伪造其他节点的 source IP。
-- 未授权节点无法注册。
-- 未授权节点无法使用 exit。
+- VIP 由服务端统一分配。
+- 服务端校验 packet source IP 必须等于连接分配的 VIP。
+- 同一 UUID 可拥有多条连接，但共享一个服务端分配的 VIP。
 
 ## 阶段 7：性能和传输扩展
 
-目标：解决 WebSocket 的性能上限。
+状态：候选方向。
 
-候选方向：
+可能方向：
 
-- QUIC transport。
-- UDP transport。
-- 多 WebSocket 连接分流。
-- 批量收发。
-- 自适应 MTU。
-- MSS clamping。
+- 自适应 MTU 和 MSS clamping。
+- 批量收发和更少日志开销。
+- 更完整的本地低延迟压测。
+- QUIC 或 UDP transport。
+- 连接池诊断命令。
 
-注意：
-
-WebSocket 是为了 MVP 和部署友好，不一定是长期最佳数据通道。
+WebSocket 适合 MVP 和反向代理部署，但不一定是长期最佳传输。

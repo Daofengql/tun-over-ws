@@ -1,12 +1,10 @@
-# 运行和部署手册
+# 运行和测试手册
 
 ## 平台支持
 
 ### 服务端
 
-服务端目标平台是 Linux。
-
-当前服务端 relay 本身只需要监听 WebSocket，不创建 server TUN；未来 exit gateway 会依赖 Linux 内核 TUN、IP forwarding、conntrack 和 NAT。
+服务端目标平台是 Linux。当前 relay 只需要监听 WebSocket，不创建 server TUN；未来 exit gateway 会依赖 Linux TUN、IP forwarding、conntrack 和 NAT。
 
 ### 客户端
 
@@ -38,8 +36,9 @@ Remove-Item Env:\GOARCH
 验证：
 
 ```powershell
-go test ./...
+go test -timeout 60s ./...
 go vet ./...
+git diff --check
 ```
 
 Windows 客户端运行前确认：
@@ -56,7 +55,7 @@ Linux 客户端运行前确认：
 
 ## 配置说明
 
-服务端开发配置：
+服务端开发配置示例：
 
 ```yaml
 listen: ":18443"
@@ -76,7 +75,7 @@ heartbeat:
   interval: 30s
 ```
 
-客户端开发配置：
+客户端开发配置示例：
 
 ```yaml
 server_url: "ws://127.0.0.1:18443/tunnel"
@@ -96,8 +95,9 @@ routes:
 - 服务端会跳过 `server_tun.ip`，默认第一个客户端拿到 `10.66.0.2`。
 - `server_tun.enabled` 当前不影响 overlay relay；exit 还未实现。
 - UUID/token 是开发测试字段，后续会替换为签名登录机制。
+- 真实配置文件、token、远端地址和临时 URL 不应提交。
 
-## 本地 Windows overlay 测试
+## 本地 Windows Overlay 测试
 
 需要管理员 PowerShell。
 
@@ -128,7 +128,7 @@ ping -S 10.66.0.2 10.66.0.3
 .\scripts\test-tun.ps1
 ```
 
-## Windows/Linux overlay 测试
+## Windows/Linux Overlay 测试
 
 跨平台测试使用本地配置文件，不在公开仓库中保存任何公网地址、连接 URL、临时 token 或主机信息。
 
@@ -146,13 +146,57 @@ ping -S 10.66.0.3 10.66.0.2
 
 不要修改 Linux 或 Windows 默认路由。当前测试只要求 overlay connected route 生效。
 
+## iperf3 测试
+
+可以用 `iperf3` 验证 TCP/UDP 双向转发。示例中 Windows 是 `10.66.0.3`，Linux 是 `10.66.0.2`。
+
+Windows 启动 server：
+
+```powershell
+.\iperf3.exe -s -B 10.66.0.3 -p 5201
+```
+
+Linux -> Windows TCP：
+
+```bash
+iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 5201 -t 10 -M 1000
+```
+
+Windows -> Linux TCP：
+
+```bash
+iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 5201 -t 10 -M 1000 -R --get-server-output
+```
+
+Linux -> Windows UDP：
+
+```bash
+iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 5201 -t 10 -u -b 5M -l 1000
+```
+
+Windows -> Linux UDP：
+
+```bash
+iperf3 -c 10.66.0.3 -B 10.66.0.2 -p 5201 -t 10 -u -b 5M -l 1000 -R
+```
+
+当前一次跨平台远端测试观察：
+
+- UDP 1M/5M 双向 0% 丢包。
+- TCP 双向可通。
+- Windows -> Linux TCP 明显好于 Linux -> Windows。
+- Linux -> Windows TCP 吞吐低且重传多，后续需继续定位。
+- 压测期间没有再出现无故 primary 轮换或连接池重连风暴。
+
+远端链路 RTT 高时，吞吐数字只能作为功能和稳定性信号，不应当作为最终性能结论。
+
 ## 停止测试进程
 
 如果使用后台进程，可用这些命令收尾：
 
 ```bash
-pkill -f 'wsvpn.*server'
-pkill -f 'wsvpn.*client'
+pkill -x wsvpn || true
+pkill -x iperf3 || true
 ip link show wsvpn0
 ```
 
@@ -161,6 +205,12 @@ ip link show wsvpn0
 ```bash
 ip addr del 10.66.0.2/24 dev wsvpn0 2>/dev/null || true
 ip link set dev wsvpn0 down 2>/dev/null || true
+```
+
+Windows 停止本地测试进程：
+
+```powershell
+Get-Process wsvpn,iperf3 -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 ## 日志判断
@@ -172,18 +222,19 @@ registered with server virtual_ip=10.66.0.x overlay_cidr=10.66.0.0/24
 tun device created
 tun configured
 client ready
+standby added
 ```
 
 客户端发包：
 
 ```text
-tun -> ws src=10.66.0.x dst=10.66.0.y
+tun -> pool src=10.66.0.x dst=10.66.0.y class=tcp
 ```
 
 服务端转发：
 
 ```text
-forwarded from=10.66.0.x dst=10.66.0.y
+forwarded from=10.66.0.x dst=10.66.0.y class=tcp
 ```
 
 客户端收包：
@@ -192,15 +243,27 @@ forwarded from=10.66.0.x dst=10.66.0.y
 ws -> tun src=10.66.0.x dst=10.66.0.y
 ```
 
+稳定连接池不应频繁出现：
+
+```text
+rotation threshold reached
+primary rotated
+conn read ended
+reconnect
+```
+
+这些日志如果在直连或空闲场景频繁出现，优先检查 standby 是否被空闲读超时关闭、计划关闭是否被纳入超时探测样本。
+
 常见 debug 噪音：
 
-- `not an IPv4 packet: version 6`：系统把 IPv6 包送进 TUN，当前 MVP 不支持 IPv6，会丢弃。
+- `not an IPv4 packet: version 6`：系统把 IPv6 包送进 TUN，当前不支持 IPv6，会丢弃。
 - `dst not found, dropping`：目标 VIP 不在线，或者 VIP 分配和测试命令不一致。
 - `exit disabled, dropping`：目标不在 overlay 内，当前没有 exit gateway。
 
 已修复过的关键问题：
 
 - Linux `tun write failed: invalid offset`：wireguard-go Linux TUN 后端需要读写 buffer headroom；当前 `internal/tun/tun.go` 使用 `tunPacketOffset = 16`。
+- standby 空闲读超时导致假断连样本：连接池读取 WebSocket 不再给正常 read 加固定短超时，计划内关闭也不会喂给 timeout detector。
 
 ## 未来服务端出口配置示例
 
@@ -218,9 +281,7 @@ sysctl -w net.ipv4.ip_forward=1
 iptables -t nat -A POSTROUTING -s 10.66.0.0/24 -o eth0 -j MASQUERADE
 ```
 
-如果使用 nftables，后续可提供等价配置。
-
-## 未来客户端 exit 路由示例
+## 未来客户端 Exit 路由示例
 
 仅 overlay（当前默认）：
 
@@ -236,11 +297,11 @@ ip route add 0.0.0.0/1 dev wsvpn0
 ip route add 128.0.0.0/1 dev wsvpn0
 ```
 
-注意：必须保留到服务端公网 IP 的真实路由，否则 WebSocket 连接可能被送进自己的隧道。
+必须保留到服务端公网 IP 的真实路由，否则 WebSocket 连接可能被送进自己的隧道。
 
 ## 反向代理
 
-WebSocket 可以放在 HTTPS 反向代理后面，例如：
+WebSocket 可以放在 HTTPS 反向代理后面：
 
 ```text
 client -> wss://vpn.example.com/tunnel -> reverse proxy -> wsvpn server
@@ -261,7 +322,7 @@ server_tun_ip: 10.66.0.1
 client_mtu: 1280
 transport: websocket
 tls: required in production
-ipv6: disabled in MVP
+ipv6: disabled in current version
 ```
 
 ## 诊断建议
@@ -271,17 +332,19 @@ ipv6: disabled in MVP
 - 客户端 TUN 是否创建成功。
 - 客户端虚拟 IP 是否配置成功。
 - 客户端路由表是否有 overlay connected route。
-- WebSocket 是否连接成功。
-- 服务端是否注册了正确的虚拟 IP。
+- WebSocket 是否连接成功，standby 是否已注册。
+- 服务端是否注册了正确的虚拟 IP 和连接数。
 - 服务端是否因为目标 IP 未命中而丢包。
 - 服务端是否因为 source IP 不等于 VIP 而丢包。
-- 服务端出口模式下 `ip_forward` 是否开启。
-- NAT 规则是否命中。
+- 是否出现无故 rotation/reconnect。
+- Windows TUN MTU 和分片行为是否异常。
+- 服务端出口模式下 `ip_forward` 和 NAT 是否配置正确。
 
 建议后续内置诊断命令：
 
 ```text
 wsvpn diag routes
 wsvpn diag tun
+wsvpn diag pool
 wsvpn diag server
 ```

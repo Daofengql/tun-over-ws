@@ -375,6 +375,7 @@ func TestServerEnqueueTCPExistingFlowStaysBound(t *testing.T) {
 	primary := newTestRelayClient(2)
 	standby := newTestRelayClient(2)
 	primary.WriteCh <- []byte("queued")
+	primary.WriteCh <- []byte("queued-2")
 
 	synPkt, synRaw := buildTestTCPPacket(
 		netip.MustParseAddr("10.66.0.2"),
@@ -398,8 +399,8 @@ func TestServerEnqueueTCPExistingFlowStaysBound(t *testing.T) {
 	if ok := srv.enqueueTCP(context.Background(), []*client{primary, standby}, ackPkt, ackRaw); !ok {
 		t.Fatal("existing flow enqueue returned false")
 	}
-	if len(primary.WriteCh) != 1 {
-		t.Fatalf("primary queue length: got %d want 1", len(primary.WriteCh))
+	if len(primary.WriteCh) != 2 {
+		t.Fatalf("primary queue length: got %d want 2", len(primary.WriteCh))
 	}
 	if got := <-standby.WriteCh; string(got) != string(ackRaw) {
 		t.Fatalf("standby packet mismatch")

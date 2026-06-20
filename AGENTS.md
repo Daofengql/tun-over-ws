@@ -1,71 +1,79 @@
-# AGENTS.md
+# AI 接手说明
 
-## Overview
+## 项目概览
 
-This file describes the project conventions for AI agents working on this codebase.
+`tun-over-ws` 是一个 Go 单二进制三层组网工具。客户端创建 TUN 虚拟网卡，把原始 IPv4 包通过 WebSocket 发给中心 relay 服务端；服务端按虚拟 IP 转发 overlay 内网流量。
 
-`wsvpn` is a centralized WebSocket L3 VPN prototype. Clients create TUN interfaces and send raw IPv4 packets over WebSocket to a Linux relay server. The current working path is overlay client-to-client forwarding; exit gateway is not implemented yet.
+当前主线是 overlay 客户端互通。服务端出口（exit gateway）还没有实现。
 
-## Project Structure
+## 当前进度
+
+已完成并验证：
+
+- 配置解析、IPv4 包解析、WebSocket relay、VIP 动态分配。
+- Windows 和 Linux TUN 客户端。
+- 固定大小 WebSocket 连接池：单 primary + 多 standby。
+- primary 断开后的 standby 提升、后台补建、重连。
+- TCP flow 绑定和背压模型：已有 TCP flow 不跨连接乱序，队列满时阻塞 TUN 读取路径，让内层 TCP 自然降速。
+- UDP 独立策略：primary 满时可尝试 standby，仍不可用则快速丢弃。
+- 组播、广播、IGMP 等噪声流量过滤。
+- CDN/nginx 连接寿命探测和计划轮换；计划内关闭不会再被误判为远端超时。
+- Windows 单机双客户端 overlay ping。
+- Linux 服务端 + Linux 客户端 + Windows 客户端 overlay ping。
+- 跨平台 `iperf3` 基础测试：UDP 1M/5M 双向 0% 丢包；TCP 双向可通。
+
+未实现或仍需谨慎处理：
+
+- exit gateway、server TUN、NAT 和默认路由接管。
+- 生产级认证；当前 UUID/token 只是开发测试字段。
+- ACL、审计日志、持久化节点/VIP、配置热加载。
+- Linux -> Windows TCP 吞吐仍偏低且有较多重传，后续需要继续查 Windows TUN MTU、写入路径和分片行为。
+
+## 目录约定
 
 ```text
 tun-over-ws/
-  bin/                  # Build output (gitignored)
-  cmd/wsvpn/            # CLI entry point (cobra)
-    main.go             # Root command, logger setup
-    server.go           # Server subcommand
-    client.go           # Client subcommand
+  bin/                  构建产物，忽略提交
+  cmd/wsvpn/            Cobra CLI 入口
   internal/
-    config/             # YAML config parsing and validation
-    conn/               # Client connection pool, QoS detection, congestion control, TUN pump
-    logger/             # Colored zerolog setup
-    packet/             # IPv4 packet parsing
-    relay/              # Server relay, VIP allocator, forwarding, source validation
-    tun/                # TUN device (wireguard-go), platform IP config
-  configs/              # Local config files (gitignored)
-  scripts/              # Helper scripts (test-tun.ps1)
-  docs/                 # Design, operations, roadmap, handoff documents
+    config/             YAML 配置解析和校验
+    conn/               客户端连接池、QoS 观测、背压、TUN 数据泵
+    logger/             zerolog 彩色终端日志
+    packet/             IPv4 包解析和流量分类
+    relay/              服务端 relay、VIP 分配、转发、源地址校验
+    tun/                TUN 封装和平台 IP 配置
+  configs/              本地配置，忽略提交
+  scripts/              辅助脚本
+  docs/                 架构、运维、路线和交接文档
 ```
 
-## Development Rules
+## 开发规则
 
-1. Go code goes in `cmd/` or `internal/` only. Never put Go files in the repo root.
-2. Platform-specific files use build tags through filename suffixes: `_windows.go`, `_linux.go`.
-3. Tests use standard `_test.go` naming. Run with `go test ./...`.
-4. Binary output goes to `bin/`. Never commit binaries or `wintun.dll`.
-5. Local config files go in `configs/` or `testdata/`; both are gitignored.
-6. Use YAML only for config.
-7. Keep the current MVP overlay-only unless the user explicitly asks for exit gateway work.
-8. Do not treat UUID/token as production auth; they are test-stage fields and will be replaced later.
+1. Go 代码只放在 `cmd/` 和 `internal/`，不要在仓库根目录放 `.go` 文件。
+2. 平台相关代码使用 `_windows.go`、`_linux.go` 文件后缀。
+3. 测试使用标准 `_test.go` 命名，优先运行 `go test ./...`。
+4. 构建产物放在 `bin/`，不要提交二进制、`wintun.dll`、日志或测试配置。
+5. 本地配置放在 `configs/` 或 `testdata/`，二者都不应被追踪。
+6. 配置格式只使用 YAML。
+7. 不要把远端 IP、登录信息、token、临时 URL 写入文档或提交历史。
+8. 除非用户明确要求，否则不要开始 exit gateway 工作。
+9. 不要把 UUID/token 当成生产认证；后续会替换为服务端签名登录。
 
-## Current Status
-
-- Phase 0-2 complete: config, packet parsing, WebSocket relay, VIP allocation.
-- Phase 3 complete: Windows and Linux TUN clients, overlay relay verified with ping.
-- Phase 4 (exit mode): not started.
-- Phase 5 (stability): heartbeat (30s), auto-reconnect with exponential backoff, source VIP validation, connection replacement, connection pool with weighted routing.
-- Phase 6 (security): only test token auth and source VIP validation exist. ACL and signed login are not implemented.
-
-Verified scenarios:
-
-- Windows single-machine two-client overlay ping.
-- Remote Linux server + Linux client + Windows client overlay ping.
-- Linux -> Windows: `ping -I 10.66.0.2 -c 4 -W 2 10.66.0.3`, 0% packet loss during the recorded test.
-
-## Testing
-
-Core checks:
+## 常用命令
 
 ```powershell
-go test ./...
+go test -timeout 60s ./...
 go vet ./...
 go build -o .\bin\wsvpn.exe .\cmd\wsvpn
-$env:GOOS = "linux"; $env:GOARCH = "amd64"; go build -o .\bin\wsvpn-linux-amd64 .\cmd\wsvpn
+
+$env:GOOS = "linux"
+$env:GOARCH = "amd64"
+go build -o .\bin\wsvpn-linux-amd64 .\cmd\wsvpn
 Remove-Item Env:\GOOS
 Remove-Item Env:\GOARCH
 ```
 
-Local Windows integration test requires admin PowerShell:
+Windows 本地集成测试需要管理员 PowerShell：
 
 ```powershell
 .\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
@@ -74,19 +82,20 @@ Local Windows integration test requires admin PowerShell:
 ping -S 10.66.0.2 10.66.0.3
 ```
 
-Remote Windows/Linux overlay test uses explicit source/interface ping. Do not change default routes for the current MVP.
+跨平台测试只使用 overlay connected route 和显式源地址/接口，不修改默认路由。
 
-## Key Dependencies
+## 关键依赖
 
-- `github.com/coder/websocket` - WebSocket library
-- `golang.zx2c4.com/wireguard/tun` - TUN device (cross-platform)
-- `github.com/spf13/cobra` - CLI framework
-- `github.com/rs/zerolog` - Structured logging
-- `gopkg.in/yaml.v3` - YAML config
+- `github.com/coder/websocket`：WebSocket 传输。
+- `golang.zx2c4.com/wireguard/tun`：跨平台 TUN。
+- `github.com/spf13/cobra`：CLI。
+- `github.com/rs/zerolog`：日志。
+- `gopkg.in/yaml.v3`：YAML 配置。
 
-## Known Implementation Notes
+## 实现注意事项
 
-- Linux TUN read/write must preserve headroom. `internal/tun/tun.go` uses `tunPacketOffset = 16`; do not remove it without retesting Linux packet writes.
-- IPv6 packets currently show as debug noise and are dropped.
-- `routes.exit.enabled` is not wired to default route changes.
-- `--send-to` is a placeholder and does not currently inject a real packet.
+- Linux TUN 读写需要保留 headroom；`internal/tun/tun.go` 中的 `tunPacketOffset = 16` 不要轻易删除。
+- IPv6 当前不支持，会以 debug 日志丢弃。
+- `routes.exit.enabled` 目前不会配置默认路由。
+- `--send-to` 仍是占位测试参数，不会注入真实数据包。
+- 连接池当前是 primary/standby 背压模型，不是多连接加权随机分流。

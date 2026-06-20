@@ -24,7 +24,6 @@ const (
 	stateUpdateInterval  = 200 * time.Millisecond
 	connectionTimeout    = 15 * time.Second
 	poolPingInterval     = 30 * time.Second
-	poolReadTimeout      = 90 * time.Second
 	poolWriteTimeout     = 30 * time.Second
 	waitPrimaryInterval  = 100 * time.Millisecond
 	udpBurstWait         = 10 * time.Millisecond
@@ -54,11 +53,13 @@ type pooledConn struct {
 	vip     netip.Addr
 	role    connRole
 
-	writeMu   sync.Mutex
-	alive     atomic.Bool
-	closeOnce sync.Once
-	cancel    context.CancelFunc
-	done      chan struct{}
+	writeMu      sync.Mutex
+	alive        atomic.Bool
+	plannedClose atomic.Bool
+	closeOnce    sync.Once
+	cancel       context.CancelFunc
+	done         chan struct{}
+	primarySince time.Time
 }
 
 type tcpFlowBinding struct {
@@ -136,7 +137,7 @@ func (p *Pool) Connect(ctx context.Context) error {
 
 	p.startConn(ctx, pc)
 	p.mu.Lock()
-	pc.role = rolePrimary
+	pc.setRole(rolePrimary)
 	p.conns = append(p.conns, pc)
 	p.mu.Unlock()
 	p.ensureStandbys(ctx)
@@ -565,7 +566,7 @@ func (p *Pool) normalizePrimaryLocked() *pooledConn {
 		if primary == nil {
 			primary = pc
 		} else {
-			pc.role = roleStandby
+			pc.setRole(roleStandby)
 		}
 	}
 	if primary != nil {
@@ -581,13 +582,13 @@ func (p *Pool) normalizePrimaryLocked() *pooledConn {
 func (p *Pool) promoteStandbyLocked() *pooledConn {
 	for _, pc := range p.conns {
 		if pc.role == roleStandby && pc.isAlive() {
-			pc.role = rolePrimary
+			pc.setRole(rolePrimary)
 			return pc
 		}
 	}
 	for _, pc := range p.conns {
 		if pc.isAlive() && pc.role != roleDraining {
-			pc.role = rolePrimary
+			pc.setRole(rolePrimary)
 			return pc
 		}
 	}
@@ -619,11 +620,12 @@ func (p *Pool) rotatePrimaryLocked(ctx context.Context, reason string) {
 		return
 	}
 
-	current.role = roleDraining
-	next.role = rolePrimary
+	current.setRole(roleDraining)
+	current.plannedClose.Store(true)
+	next.setRole(rolePrimary)
 	p.log.Info().
 		Str("reason", reason).
-		Dur("old_age", current.state.Age()).
+		Str("old_age", current.state.Age().String()).
 		Msg("primary rotated")
 	go p.closeAfterDrain(current, 5*time.Second)
 	p.scheduleBuildLocked(ctx)
@@ -676,7 +678,9 @@ func (p *Pool) monitorTick(ctx context.Context) {
 		if pc.isAlive() {
 			live = append(live, pc)
 		} else {
-			p.timeoutDetect.RecordDisconnect(pc.state.Age())
+			if !pc.plannedClose.Load() {
+				p.timeoutDetect.RecordDisconnect(pc.state.Age())
+			}
 			pc.close()
 		}
 	}
@@ -684,15 +688,16 @@ func (p *Pool) monitorTick(ctx context.Context) {
 
 	p.ensurePrimaryLocked(ctx)
 
-	rotationInterval := p.timeoutDetect.GetRotationInterval()
-	for _, pc := range p.conns {
-		if pc.role == rolePrimary && pc.isAlive() && pc.state.Age() > rotationInterval {
-			p.log.Info().
-				Dur("age", pc.state.Age()).
-				Dur("rotation", rotationInterval).
-				Msg("rotation threshold reached")
-			p.rotatePrimaryLocked(ctx, "rotation")
-			break
+	if rotationInterval, ok := p.timeoutDetect.RotationInterval(); ok {
+		for _, pc := range p.conns {
+			if pc.role == rolePrimary && pc.isAlive() && pc.primaryAge() > rotationInterval {
+				p.log.Info().
+					Str("primary_age", pc.primaryAge().String()).
+					Str("rotation_interval", rotationInterval.String()).
+					Msg("rotation threshold reached")
+				p.rotatePrimaryLocked(ctx, "rotation")
+				break
+			}
 		}
 	}
 
@@ -812,7 +817,7 @@ func (p *Pool) buildStandby(ctx context.Context) {
 		pc.close()
 		return
 	}
-	pc.role = roleStandby
+	pc.setRole(roleStandby)
 	p.conns = append(p.conns, pc)
 	p.log.Info().Int("pool_size", len(p.conns)).Str("role", string(pc.role)).Msg("standby added")
 	p.mu.Unlock()
@@ -949,6 +954,20 @@ func (pc *pooledConn) isAlive() bool {
 	return pc.alive.Load()
 }
 
+func (pc *pooledConn) setRole(role connRole) {
+	pc.role = role
+	if role == rolePrimary {
+		pc.primarySince = time.Now()
+	}
+}
+
+func (pc *pooledConn) primaryAge() time.Duration {
+	if pc == nil || pc.primarySince.IsZero() {
+		return 0
+	}
+	return time.Since(pc.primarySince)
+}
+
 func (pc *pooledConn) tryEnqueue(data []byte) bool {
 	if !pc.isAlive() {
 		return false
@@ -1030,9 +1049,7 @@ func (pc *pooledConn) close() {
 }
 
 func (pc *pooledConn) read(ctx context.Context) (websocket.MessageType, []byte, error) {
-	readCtx, cancel := context.WithTimeout(ctx, poolReadTimeout)
-	defer cancel()
-	return pc.ws.Read(readCtx)
+	return pc.ws.Read(ctx)
 }
 
 func (pc *pooledConn) write(ctx context.Context, data []byte) error {
