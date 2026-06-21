@@ -43,11 +43,11 @@ Client A TUN
 - IPv4：当前支持。
 - IPv6：第一版不支持，收到 IPv6 包时丢弃并输出 debug 日志。
 
-最终产物叫 `wsvpn`，通过子命令区分角色：
+最终产物拆分为服务端和客户端两个二进制：
 
 ```text
-wsvpn server --config server.yaml
-wsvpn client --config client.yaml
+wsvpns --config server.yaml
+wsvpnc --config client.yaml
 ```
 
 ## 客户端职责
@@ -55,7 +55,7 @@ wsvpn client --config client.yaml
 客户端负责：
 
 - 创建 TUN。
-- 通过 hello 注册身份（UUID + token），接收服务端分配的虚拟 IP。
+- 通过设备授权获得 AK/RK，并在 hello 中使用设备 ID + AK 注册，接收服务端返回的虚拟 IP。
 - 配置 TUN 的虚拟 IP 和 MTU。
 - 使用系统 connected route 让 overlay 网段进入 TUN。
 - 维护到服务端的固定大小 WebSocket 连接池。
@@ -75,14 +75,14 @@ wsvpn client --config client.yaml
 服务端负责：
 
 - 接受客户端 WebSocket 连接。
-- 验证 UUID + token 身份（当前为测试实现）。
-- 动态分配虚拟 IP，维护 `virtual_ip -> client connections` 映射。
+- 通过 SQLite 中的设备记录验证 AK、审批状态和过期时间。
+- 使用设备记录中的 `virtual_ip` 或 `auto_vip`，维护 `virtual_ip -> client connections` 映射。
 - 解析 IP 包目标地址。
 - 检查包的 source IP 是否等于该客户端被分配的 VIP。
 - 对 overlay 流量转发到目标客户端。
 - 对非 overlay 流量丢弃；未来 exit 模式会在这里写入 server TUN。
 - 记录连接、注册、转发、丢包原因。
-- 同一 UUID 支持多条连接（连接池），转发时按 primary/standby 语义处理。
+- 同一设备 ID 支持多条连接（连接池），转发时按 primary/standby 语义处理。
 
 服务端不应该在第一版里：
 
@@ -176,12 +176,12 @@ QoS 检测（`internal/conn/connstate.go`）：
 
 - 每个客户端连接有独立 read/write/heartbeat goroutine。
 - 服务端根 context 取消时会推动连接关闭。
-- 同 UUID 多条连接共存。
+- 同一设备 ID 多条连接共存。
 - 转发 TCP 时使用目标 VIP 的第一条存活连接作为 inferred primary，并维护服务端侧 TCP flow 绑定。
 - 已有 TCP flow 固定写入绑定连接；新 TCP flow 在 inferred primary 高压时可尝试 standby 非阻塞突发。
 - TCP 目标队列满时等待，避免立即丢 TCP 包。
 - 转发 UDP 时可在 primary 满时尝试 standby，否则快速丢弃。
-- 连接注销时从列表中移除指定连接，不影响同 UUID 的其他连接。
+- 连接注销时从列表中移除指定连接，不影响同一设备 ID 的其他连接。
 
 ## 控制平面
 
@@ -190,8 +190,8 @@ QoS 检测（`internal/conn/connstate.go`）：
 客户端 hello：
 
 ```text
-uuid          客户端唯一标识（当前来自配置，未来来自登录系统）
-token         认证令牌（当前为测试 token）
+device_id     machine_id 派生的设备唯一标识
+token         访问密钥 AK（设备认证，数据库保存 hash）
 hostname      主机名
 want_exit     是否请求出口（当前固定 false）
 client_version
@@ -202,8 +202,8 @@ client_version
 ```json
 {
   "type": "hello",
-  "uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "token": "replace-me",
+  "device_id": "dev-a1b2c3d4...",
+  "ak": "hex-string...",
   "hostname": "laptop-a",
   "want_exit": false
 }
@@ -221,7 +221,7 @@ client_version
 }
 ```
 
-同一 UUID 支持多条连接同时注册，每条连接独立完成 hello 握手。
+同一设备 ID 支持多条连接同时注册，每条连接独立完成 hello 握手。
 
 ## Overlay 转发
 
@@ -278,14 +278,14 @@ NAT 10.66.0.0/24 out via eth0
 
 当前已做：
 
-- WebSocket 连接 token 校验。
+- WebSocket 连接 AK 校验。
 - 虚拟 IP 由服务端统一分配，不允许客户端自报。
 - 检查包的 source IP 是否等于该客户端被分配的 VIP。
-- 同 UUID 多连接共存，转发按 primary/standby、流量类型和 TCP flow 绑定处理。
+- 同一设备 ID 多连接共存，转发按 primary/standby、流量类型和 TCP flow 绑定处理。
 
 仍需补齐：
 
-- token 替换为节点密钥、证书或服务端签名登录。
+- 完善 AK/RK 轮换、撤销、审计和管理员认证策略。
 - 检查目标 IP 是否允许访问。
 - ACL。
 - 限制单客户端速率和并发。

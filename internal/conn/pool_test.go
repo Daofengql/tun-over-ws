@@ -47,7 +47,7 @@ func newTestTCPPacket(srcPort, dstPort uint16, flags uint8) (*packet.Packet, []b
 }
 
 func TestPoolEnqueueTCPBlocksOnPrimary(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	primary := newTestPooledConn(rolePrimary, 1)
 	primary.writeCh <- []byte("queued")
 	p.conns = []*pooledConn{primary}
@@ -98,7 +98,7 @@ func TestPooledConnEnqueueSucceedsAfterQueueAccepts(t *testing.T) {
 }
 
 func TestPoolEnqueueUDPUsesStandbyWhenPrimaryFull(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	primary := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)
 	primary.writeCh <- []byte("queued")
@@ -116,7 +116,7 @@ func TestPoolEnqueueUDPUsesStandbyWhenPrimaryFull(t *testing.T) {
 }
 
 func TestPoolEnqueueTCPNewFlowCanBurstToStandbyWhenPrimaryDegraded(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	primary := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)
 	primary.state.MarkDegraded("test")
@@ -135,7 +135,7 @@ func TestPoolEnqueueTCPNewFlowCanBurstToStandbyWhenPrimaryDegraded(t *testing.T)
 }
 
 func TestPoolEnqueueTCPExistingFlowStaysBound(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	primary := newTestPooledConn(rolePrimary, 2)
 	standby := newTestPooledConn(roleStandby, 2)
 	primary.state.MarkDegraded("test")
@@ -160,7 +160,7 @@ func TestPoolEnqueueTCPExistingFlowStaysBound(t *testing.T) {
 }
 
 func TestPoolPromotesStandbyWhenPrimaryDead(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	primary := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)
 	primary.close()
@@ -177,7 +177,7 @@ func TestPoolPromotesStandbyWhenPrimaryDead(t *testing.T) {
 }
 
 func TestPoolNormalizePrimaryKeepsOnePrimary(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	first := newTestPooledConn(rolePrimary, 1)
 	second := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)
@@ -203,7 +203,7 @@ func TestPoolNormalizePrimaryKeepsOnePrimary(t *testing.T) {
 }
 
 func TestPoolEnsureStandbysRespectsMaxTotal(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	p.maxTotal = 3
 	p.conns = []*pooledConn{
 		newTestPooledConn(rolePrimary, 1),
@@ -222,7 +222,7 @@ func TestPoolEnsureStandbysRespectsMaxTotal(t *testing.T) {
 }
 
 func TestPoolRotatePrimaryPromotesStandby(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	p.maxTotal = 2
 	primary := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)
@@ -239,7 +239,7 @@ func TestPoolRotatePrimaryPromotesStandby(t *testing.T) {
 }
 
 func TestPoolMonitorRotatesPrimaryAtTimeoutThreshold(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	p.maxTotal = 2
 	p.timeoutDetect = NewTimeoutDetector(testRotationInterval)
 	primary := newTestPooledConn(rolePrimary, 1)
@@ -261,7 +261,7 @@ func TestPoolMonitorRotatesPrimaryAtTimeoutThreshold(t *testing.T) {
 }
 
 func TestPoolMonitorDoesNotRotateNewPrimaryByConnectionAge(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	p.maxTotal = 2
 	p.timeoutDetect = NewTimeoutDetector(testRotationInterval)
 	primary := newTestPooledConn(rolePrimary, 1)
@@ -284,7 +284,7 @@ func TestPoolMonitorDoesNotRotateNewPrimaryByConnectionAge(t *testing.T) {
 }
 
 func TestPoolMonitorIgnoresPlannedCloseForTimeoutDetection(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	pc := newTestPooledConn(roleDraining, 1)
 	pc.state.createdAt = time.Now().Add(-2 * testRotationInterval)
 	pc.plannedClose.Store(true)
@@ -299,7 +299,7 @@ func TestPoolMonitorIgnoresPlannedCloseForTimeoutDetection(t *testing.T) {
 }
 
 func TestPoolMonitorDoesNotRotateWithoutDetectedTimeout(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	p.maxTotal = 2
 	primary := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)
@@ -317,7 +317,7 @@ func TestPoolMonitorDoesNotRotateWithoutDetectedTimeout(t *testing.T) {
 }
 
 func TestPoolMonitorBuildsStandbyOnSustainedWriteLatency(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	p.maxTotal = 3
 	primary := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)
@@ -340,7 +340,7 @@ func TestPoolMonitorBuildsStandbyOnSustainedWriteLatency(t *testing.T) {
 }
 
 func TestPoolMonitorRotatesPrimaryOnCriticalLatency(t *testing.T) {
-	p := NewPool("ws://example.invalid/tunnel", "uuid", "token", "wsvpn-test", 1280)
+	p := NewPool("ws://example.invalid/tunnel", "device-id", "token", "wsvpn-test", 1280)
 	p.maxTotal = 3
 	primary := newTestPooledConn(rolePrimary, 1)
 	standby := newTestPooledConn(roleStandby, 1)

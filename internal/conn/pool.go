@@ -75,8 +75,8 @@ type Pool struct {
 	tcpFlows   map[packet.TCPFlowKey]tcpFlowBinding
 
 	serverURL string
-	uuid      string
-	token     string
+	deviceID  string
+	accessKey string
 	tunName   string
 	mtu       int
 
@@ -94,7 +94,7 @@ type Pool struct {
 }
 
 // NewPool creates a connection pool.
-func NewPool(serverURL, uuid, token, tunName string, mtu int) *Pool {
+func NewPool(serverURL, deviceID, accessKey, tunName string, mtu int) *Pool {
 	if tunName == "" {
 		tunName = "wsvpn0"
 	}
@@ -103,8 +103,8 @@ func NewPool(serverURL, uuid, token, tunName string, mtu int) *Pool {
 	}
 	return &Pool{
 		serverURL:     serverURL,
-		uuid:          uuid,
-		token:         token,
+		deviceID:      deviceID,
+		accessKey:     accessKey,
 		tunName:       tunName,
 		mtu:           mtu,
 		maxTotal:      defaultMaxTotal,
@@ -859,11 +859,11 @@ func (p *Pool) buildConn(ctx context.Context) (*pooledConn, error) {
 
 func (p *Pool) hello(ctx context.Context, wsConn *websocket.Conn) (netip.Addr, error) {
 	hello := HelloMessage{
-		Type:     "hello",
-		UUID:     p.uuid,
-		Token:    p.token,
-		Hostname: hostname(),
-		WantExit: false,
+		Type:      "hello",
+		DeviceID:  p.deviceID,
+		AccessKey: p.accessKey,
+		Hostname:  hostname(),
+		WantExit:  false,
 	}
 
 	data, err := json.Marshal(hello)

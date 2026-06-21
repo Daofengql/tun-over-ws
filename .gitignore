@@ -36,3 +36,9 @@ wintun.dll
 
 # Dependency directories
 vendor/
+node_modules/
+www/node_modules/
+www/dist/
+
+# Runtime data
+data/

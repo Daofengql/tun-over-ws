@@ -2,6 +2,8 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -17,6 +19,7 @@ import (
 	"github.com/Daofengql/tun-over-ws/internal/config"
 	"github.com/Daofengql/tun-over-ws/internal/logger"
 	"github.com/Daofengql/tun-over-ws/internal/packet"
+	"github.com/Daofengql/tun-over-ws/internal/store"
 )
 
 const (
@@ -30,7 +33,7 @@ const (
 
 // client represents a connected client.
 type client struct {
-	UUID       string
+	DeviceID   string
 	VirtualIP  netip.Addr
 	Conn       *websocket.Conn
 	WriteCh    chan []byte
@@ -49,10 +52,11 @@ type tcpFlowBinding struct {
 // Server is the WebSocket relay server.
 type Server struct {
 	cfg       *config.ServerConfig
+	store     store.Store
 	allocator *VIPAllocator
 
 	mu       sync.RWMutex
-	clients  map[string][]*client     // UUID -> connections
+	clients  map[string][]*client     // device_id -> connections
 	vipMap   map[netip.Addr][]*client // VIP -> connections
 	tcpFlows map[packet.TCPFlowKey]tcpFlowBinding
 
@@ -62,7 +66,7 @@ type Server struct {
 }
 
 // NewServer creates a new relay server.
-func NewServer(cfg *config.ServerConfig) (*Server, error) {
+func NewServer(cfg *config.ServerConfig, store store.Store) (*Server, error) {
 	serverIP, err := netip.ParseAddr(cfg.ServerTUN.IP)
 	if err != nil {
 		return nil, fmt.Errorf("invalid server tun ip: %w", err)
@@ -80,6 +84,7 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 
 	return &Server{
 		cfg:         cfg,
+		store:       store,
 		allocator:   alloc,
 		clients:     make(map[string][]*client),
 		vipMap:      make(map[netip.Addr][]*client),
@@ -93,7 +98,7 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
-		s.handleTunnel(ctx, w, r)
+		s.HandleTunnel(ctx, w, r)
 	})
 
 	server := &http.Server{
@@ -115,7 +120,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) handleTunnel(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+// HandleTunnel handles incoming WebSocket tunnel connections.
+func (s *Server) HandleTunnel(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	remoteAddr := r.RemoteAddr
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		remoteAddr = xff
@@ -133,9 +139,9 @@ func (s *Server) handleTunnel(ctx context.Context, w http.ResponseWriter, r *htt
 }
 
 func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAddr string) {
-	// Step 1: Read hello message.
+	// Step 1: Read hello message and validate device.
 	helloCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	uuid, err := s.readHello(helloCtx, conn)
+	device, err := s.readHelloAndValidate(helloCtx, conn)
 	cancel()
 	if err != nil {
 		s.log.Warn().Err(err).Str("remote", remoteAddr).Msg("hello failed")
@@ -143,24 +149,25 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 		return
 	}
 
-	// Step 2: Allocate VIP.
-	vip, err := s.allocator.Allocate(uuid)
+	// Step 2: Determine VIP from device config.
+	vipStr := device.EffectiveIP()
+	vip, err := netip.ParseAddr(vipStr)
 	if err != nil {
-		s.log.Error().Err(err).Str("uuid", uuid).Msg("vip allocation failed")
-		conn.Close(websocket.StatusInternalError, "vip allocation failed")
+		s.log.Error().Err(err).Str("device_id", device.DeviceID).Str("vip", vipStr).Msg("invalid device vip")
+		conn.Close(websocket.StatusInternalError, "invalid vip configuration")
 		return
 	}
 
 	// Step 3: Send hello_ok.
 	if err := s.sendHelloOK(ctx, conn, vip); err != nil {
-		s.log.Error().Err(err).Str("uuid", uuid).Msg("send hello_ok failed")
+		s.log.Error().Err(err).Str("device_id", device.DeviceID).Msg("send hello_ok failed")
 		conn.Close(websocket.StatusInternalError, "hello_ok failed")
 		return
 	}
 
-	// Step 4: Register client. Multiple connections may share one UUID/VIP.
+	// Step 4: Register client. Multiple connections may share one device ID/VIP.
 	c := &client{
-		UUID:       uuid,
+		DeviceID:   device.DeviceID,
 		VirtualIP:  vip,
 		Conn:       conn,
 		WriteCh:    make(chan []byte, 512),
@@ -171,7 +178,7 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 	defer s.unregisterClient(c)
 
 	s.log.Info().
-		Str("uuid", uuid).
+		Str("device_id", device.DeviceID).
 		Str("vip", vip.String()).
 		Str("remote", remoteAddr).
 		Msg("client connected")
@@ -198,39 +205,60 @@ func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn, remoteAdd
 	<-done
 }
 
-func (s *Server) readHello(ctx context.Context, conn *websocket.Conn) (string, error) {
+func (s *Server) readHelloAndValidate(ctx context.Context, conn *websocket.Conn) (*store.Device, error) {
 	_, data, err := conn.Read(ctx)
 	if err != nil {
-		return "", fmt.Errorf("read: %w", err)
+		return nil, fmt.Errorf("read: %w", err)
 	}
 
 	var hello struct {
-		Type  string `json:"type"`
-		UUID  string `json:"uuid"`
-		Token string `json:"token"`
+		Type      string `json:"type"`
+		DeviceID  string `json:"device_id"`
+		AccessKey string `json:"ak"`
+		Hostname  string `json:"hostname"`
 	}
 	if err := json.Unmarshal(data, &hello); err != nil {
-		return "", fmt.Errorf("parse hello: %w", err)
+		return nil, fmt.Errorf("parse hello: %w", err)
 	}
 	if hello.Type != "hello" {
-		return "", fmt.Errorf("expected hello, got %q", hello.Type)
+		return nil, fmt.Errorf("expected hello, got %q", hello.Type)
 	}
-	if !s.validateToken(hello.Token) {
-		return "", fmt.Errorf("invalid token")
+	if hello.DeviceID == "" {
+		return nil, fmt.Errorf("empty device_id")
 	}
-	if hello.UUID == "" {
-		return "", fmt.Errorf("empty uuid")
+	if hello.AccessKey == "" {
+		return nil, fmt.Errorf("missing access key")
 	}
-	return hello.UUID, nil
+
+	// Validate device by AK
+	device, err := s.store.GetDeviceByAK(ctx, hashToken(hello.AccessKey))
+	if err != nil {
+		return nil, fmt.Errorf("lookup device: %w", err)
+	}
+	if device == nil {
+		return nil, fmt.Errorf("invalid access key")
+	}
+	if device.DeviceID != hello.DeviceID {
+		return nil, fmt.Errorf("device_id mismatch")
+	}
+	if device.Status != store.DeviceStatusApproved {
+		return nil, fmt.Errorf("device not approved")
+	}
+	if device.KeyExpiresAt == nil || time.Now().After(*device.KeyExpiresAt) {
+		return nil, fmt.Errorf("access key expired")
+	}
+
+	// Update last seen
+	if err := s.store.UpdateDeviceLastSeen(ctx, device.DeviceID); err != nil {
+		s.log.Warn().Err(err).Str("device_id", device.DeviceID).Msg("update device last seen failed")
+	}
+
+	return device, nil
 }
 
-func (s *Server) validateToken(token string) bool {
-	for _, t := range s.cfg.Auth.Tokens {
-		if t == token {
-			return true
-		}
-	}
-	return false
+func hashToken(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])
 }
 
 func (s *Server) sendHelloOK(ctx context.Context, conn *websocket.Conn, vip netip.Addr) error {
@@ -252,13 +280,13 @@ func (s *Server) registerClient(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.clients[c.UUID] = append(s.clients[c.UUID], c)
+	s.clients[c.DeviceID] = append(s.clients[c.DeviceID], c)
 	s.vipMap[c.VirtualIP] = append(s.vipMap[c.VirtualIP], c)
 
 	s.log.Info().
-		Str("uuid", c.UUID).
+		Str("device_id", c.DeviceID).
 		Str("vip", c.VirtualIP.String()).
-		Int("total_conns", len(s.clients[c.UUID])).
+		Int("total_conns", len(s.clients[c.DeviceID])).
 		Msg("connection registered")
 }
 
@@ -267,11 +295,11 @@ func (s *Server) unregisterClient(c *client) {
 	defer s.mu.Unlock()
 
 	c.markClosed()
-	s.clients[c.UUID] = removeConn(s.clients[c.UUID], c)
+	s.clients[c.DeviceID] = removeConn(s.clients[c.DeviceID], c)
 	s.vipMap[c.VirtualIP] = removeConn(s.vipMap[c.VirtualIP], c)
 
-	if len(s.clients[c.UUID]) == 0 {
-		delete(s.clients, c.UUID)
+	if len(s.clients[c.DeviceID]) == 0 {
+		delete(s.clients, c.DeviceID)
 	}
 	if len(s.vipMap[c.VirtualIP]) == 0 {
 		delete(s.vipMap, c.VirtualIP)
@@ -279,9 +307,9 @@ func (s *Server) unregisterClient(c *client) {
 	s.removeTCPFlowsForClientLocked(c)
 
 	s.log.Info().
-		Str("uuid", c.UUID).
+		Str("device_id", c.DeviceID).
 		Str("vip", c.VirtualIP.String()).
-		Int("remaining_conns", len(s.clients[c.UUID])).
+		Int("remaining_conns", len(s.clients[c.DeviceID])).
 		Msg("connection unregistered")
 }
 
@@ -336,7 +364,7 @@ func (s *Server) serverHeartbeat(ctx context.Context, c *client) {
 			c.writeMu.Unlock()
 			cancel()
 			if err != nil {
-				s.log.Warn().Err(err).Str("uuid", c.UUID).Msg("client ping failed")
+				s.log.Warn().Err(err).Str("device_id", c.DeviceID).Msg("client ping failed")
 				c.markClosed()
 				c.Conn.Close(websocket.StatusNormalClosure, "ping timeout")
 				return
@@ -350,26 +378,26 @@ func (s *Server) readLoop(ctx context.Context, c *client) {
 		msgType, data, err := c.Conn.Read(ctx)
 		if err != nil {
 			c.markClosed()
-			s.log.Debug().Err(err).Str("uuid", c.UUID).Msg("read loop ended")
+			s.log.Debug().Err(err).Str("device_id", c.DeviceID).Msg("read loop ended")
 			return
 		}
 
 		if msgType == websocket.MessageText {
-			s.log.Debug().Str("uuid", c.UUID).RawJSON("msg", data).Msg("control msg")
+			s.log.Debug().Str("device_id", c.DeviceID).RawJSON("msg", data).Msg("control msg")
 			continue
 		}
 
 		// Binary: raw IP packet.
 		pkt, err := packet.ParseIPv4(data)
 		if err != nil {
-			s.log.Debug().Err(err).Str("uuid", c.UUID).Msg("invalid packet")
+			s.log.Debug().Err(err).Str("device_id", c.DeviceID).Msg("invalid packet")
 			continue
 		}
 
 		// Security: source IP must match allocated VIP.
 		if pkt.SrcAddr != c.VirtualIP {
 			s.log.Warn().
-				Str("uuid", c.UUID).
+				Str("device_id", c.DeviceID).
 				Str("expected", c.VirtualIP.String()).
 				Str("got", pkt.SrcAddr.String()).
 				Msg("source IP spoofed, dropping")
@@ -671,7 +699,7 @@ func (s *Server) writeLoop(ctx context.Context, c *client) {
 			cancel()
 			if err != nil {
 				c.markClosed()
-				s.log.Debug().Err(err).Str("uuid", c.UUID).Msg("write failed")
+				s.log.Debug().Err(err).Str("device_id", c.DeviceID).Msg("write failed")
 				return
 			}
 		}

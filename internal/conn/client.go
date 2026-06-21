@@ -10,11 +10,11 @@ import (
 
 // HelloMessage is the initial client registration message.
 type HelloMessage struct {
-	Type     string `json:"type"`
-	UUID     string `json:"uuid"`
-	Token    string `json:"token"`
-	Hostname string `json:"hostname"`
-	WantExit bool   `json:"want_exit"`
+	Type      string `json:"type"`
+	DeviceID  string `json:"device_id"`
+	AccessKey string `json:"ak"`
+	Hostname  string `json:"hostname"`
+	WantExit  bool   `json:"want_exit"`
 }
 
 // HelloOK is the server response with allocated VIP.
@@ -33,9 +33,9 @@ type Conn struct {
 }
 
 // New creates a backward-compatible client wrapper.
-func New(serverURL, uuid, token, tunName string) *Conn {
+func New(serverURL, deviceID, accessKey, tunName string) *Conn {
 	return &Conn{
-		pool: NewPool(serverURL, uuid, token, tunName, tun.DefaultMTU),
+		pool: NewPool(serverURL, deviceID, accessKey, tunName, tun.DefaultMTU),
 	}
 }
 

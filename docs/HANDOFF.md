@@ -2,7 +2,7 @@
 
 ## 项目定位
 
-`tun-over-ws` 是一个 Go 单二进制三层 overlay 组网工具。客户端通过 TUN 虚拟网卡捕获 IPv4 包，再通过 WebSocket 与中心服务端建立隧道，由服务端按虚拟 IP 转发。
+`tun-over-ws` 是一个 Go 三层 overlay 组网工具。服务端和客户端已拆分为 `wsvpns` / `wsvpnc` 两个二进制。
 
 它不是传统 SOCKS/HTTP 代理。传统代理处理应用层连接请求，本项目处理完整 IP 包，数据平面更接近中心化 relay VPN。
 
@@ -21,7 +21,7 @@
 - YAML 配置加载和基础校验（`internal/config`）。
 - WebSocket relay 服务端和 VIP 动态分配（`internal/relay`）。
 - 服务端 source VIP 校验，防止客户端伪造其他节点源地址。
-- 服务端支持同一 UUID/VIP 多条 WebSocket 连接。
+- 服务端支持同一设备 ID/VIP 多条 WebSocket 连接。
 - 客户端 TUN 设备创建、读写和平台 IP 配置（`internal/tun`）。
 - Windows 客户端 TUN 配置（Wintun + `netsh`）。
 - Linux 客户端 TUN 配置（wireguard-go + `ip addr` / `ip link`）。
@@ -33,14 +33,14 @@
 - QoS 观测：吞吐、写延迟 EWMA、读写字节、最后读写时间、队列深度。
 - CDN/nginx 连接寿命探测和计划轮换。
 - 计划内 draining/rotation 关闭不会参与超时学习，避免自触发重连风暴。
-- Cobra CLI 入口（`cmd/wsvpn`）。
+- Cobra CLI 入口：`cmd/wsvpns`、`cmd/wsvpnc`。
 - 彩色终端日志（`internal/logger`，zerolog）。
 
 已验证：
 
 - `go test -timeout 60s ./...` 通过。
-- Windows 构建通过：`go build -o bin\wsvpn.exe ./cmd/wsvpn`。
-- Linux amd64 构建通过：`GOOS=linux GOARCH=amd64 go build -o bin\wsvpn-linux-amd64 ./cmd/wsvpn`。
+- Windows 构建通过：`go build -o bin\wsvpns.exe ./cmd/wsvpns` 和 `go build -o bin\wsvpnc.exe ./cmd/wsvpnc`。
+- Linux amd64 构建通过：`GOOS=linux GOARCH=amd64 go build -o bin\wsvpns-linux-amd64 ./cmd/wsvpns` 和对应 client。
 - Windows 单机双客户端 overlay ping 通过。
 - Linux 服务端 + Linux 客户端 + Windows 客户端跨平台 overlay ping 通过。
 - 跨平台 `iperf3` UDP 1M/5M 双向 0% 丢包。
@@ -53,7 +53,7 @@
 
 这些点不是当前进度重点，不要把它们当成阻塞项：
 
-- UUID/token 只是测试阶段身份字段，后续会改为服务端签名登录机制。
+- 旧的配置内 UUID/token 已废弃；当前客户端使用 machine-id 派生的设备 ID + AK/RK，服务端通过管理台审批和 SQLite 设备表认证。
 - 当前不实现 exit gateway。
 - 当前不接管系统默认路由。
 - 当前不做 Linux 侧公网 NAT 出口测试。
@@ -61,9 +61,9 @@
 
 ## 关键约束
 
-- 构建产物应是一个二进制。
-- 运行时通过子命令区分服务端和客户端：`wsvpn server` / `wsvpn client`。
-- Go 代码入口放在 `cmd/wsvpn/`，业务实现放在 `internal/`，不要把 `.go` 文件堆在仓库根目录。
+- 构建产物应拆分为服务端和客户端两个二进制。
+- 运行时优先使用：`wsvpns` / `wsvpnc`。
+- Go 代码入口放在 `cmd/` 子目录，业务实现放在 `internal/`，不要把 `.go` 文件堆在仓库根目录。
 - 第一版传输层使用 WebSocket binary frame 承载原始 IPv4 包。
 - 服务端优先支持 Linux；当前 relay 不依赖 server TUN。
 - 客户端支持 Windows 和 Linux。
@@ -80,8 +80,8 @@
 1. 客户端使用 TUN，不使用 TAP。
 2. 组网层处理 IP 包，不在应用层模拟 SOCKS/HTTP。
 3. 虚拟 IP 由服务端统一分配，客户端不能自报 VIP。
-4. UUID/token 当前只是测试身份字段，未来会替换为服务端签名登录。
-5. 同一 UUID 可以有多条 WebSocket 连接，形成一个共享 VIP 的连接池。
+4. 客户端配置不再填写 UUID/token；设备 ID 由 machine-id 派生，AK/RK 自动保存在 `device_dir/device.json`。
+5. 同一设备 ID 可以有多条 WebSocket 连接，形成一个共享 VIP 的连接池。
 6. 客户端连接池保持固定大小，正常情况下只有一条 primary，其他为 standby。
 7. TCP 优先保证流顺序和背压，不做逐包加权随机分发。
 8. UDP 可以复用 standby 做突发，也可以在压力下丢弃。
@@ -92,7 +92,7 @@
 
 ## 模块划分
 
-`cmd/wsvpn`
+`cmd/wsvpns` / `cmd/wsvpnc`
 
 - CLI 入口。
 - 解析 `server` / `client` 子命令。
@@ -101,7 +101,7 @@
 `internal/config`
 
 - 解析 YAML 配置。
-- 校验 overlay CIDR、服务端地址、token、MTU。
+- 校验 overlay CIDR、服务端地址、MTU。
 - 提供默认值。
 
 `internal/tun`
@@ -127,7 +127,7 @@
 - 维护客户端注册表。
 - 根据目标 IP 做 overlay 转发。
 - 校验 source IP 必须等于该连接被分配的 VIP。
-- 同一 UUID/VIP 支持多条连接。
+- 同一设备 ID/VIP 支持多条连接。
 - 服务端侧维护 TCP flow 绑定，避免已有 flow 在目标连接池中乱序。
 - 对非 overlay 流量按当前策略丢弃。
 
@@ -192,8 +192,8 @@ route 128.0.0.0/1 -> TUN
 ## 已知问题和剩余风险
 
 - exit gateway 未实现。
-- 当前 auth 只是 token 列表 + UUID，不能用于真实生产部署。
-- VIP 分配只在进程内存中保持，服务端重启后会重新分配。
+- 管理端登录还缺少限流和审计，生产部署必须使用 HTTPS 反向代理。
+- VIP 分配已持久化到 SQLite 设备表，但并发首次注册时仍需更严格的唯一约束/事务保护。
 - `routes.exit.enabled` 目前不会真正改默认路由。
 - Linux/Windows TUN 清理是 best effort，异常退出后可能需要手动清理接口或路由。
 - 客户端 `--send-to` 仍是占位测试参数，没有真正发包。
@@ -209,6 +209,6 @@ route 128.0.0.0/1 -> TUN
 3. 在本地低延迟环境复测 TCP/UDP，排除远端高 RTT 对吞吐的放大影响。
 4. 补充连接池跨机器压测脚本或半自动测试说明。
 5. 增加 metrics：连接数、转发包数、字节数、丢包原因、重连/轮换次数。
-6. 引入服务端签名登录机制，替换测试 UUID/token。
+6. 完善认证安全：登录限流、审计日志、管理员密码轮换和设备操作记录。
 7. 设计 exit gateway 的 server TUN、NAT、权限和路由保护。
 8. 再考虑 QUIC/UDP transport，避免过早优化 WebSocket 数据平面。

@@ -11,10 +11,10 @@ type VIPAllocator struct {
 	mu       sync.Mutex
 	prefix   netip.Prefix
 	serverIP netip.Addr
-	// allocated maps allocated IP -> UUID
+	// allocated maps allocated IP -> device ID
 	allocated map[netip.Addr]string
-	// uuidToIP maps UUID -> allocated IP
-	uuidToIP map[string]netip.Addr
+	// deviceToIP maps device ID -> allocated IP
+	deviceToIP map[string]netip.Addr
 }
 
 // NewVIPAllocator creates a new allocator for the given CIDR.
@@ -25,20 +25,20 @@ func NewVIPAllocator(cidr string, serverIP netip.Addr) (*VIPAllocator, error) {
 		return nil, fmt.Errorf("invalid CIDR: %w", err)
 	}
 	return &VIPAllocator{
-		prefix:    prefix,
-		serverIP:  serverIP,
-		allocated: make(map[netip.Addr]string),
-		uuidToIP: make(map[string]netip.Addr),
+		prefix:     prefix,
+		serverIP:   serverIP,
+		allocated:  make(map[netip.Addr]string),
+		deviceToIP: make(map[string]netip.Addr),
 	}, nil
 }
 
-// Allocate returns an IP for the given UUID.
-// If the UUID already has an allocation, it returns the same IP.
-func (a *VIPAllocator) Allocate(uuid string) (netip.Addr, error) {
+// Allocate returns an IP for the given device ID.
+// If the device already has an allocation, it returns the same IP.
+func (a *VIPAllocator) Allocate(deviceID string) (netip.Addr, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if ip, ok := a.uuidToIP[uuid]; ok {
+	if ip, ok := a.deviceToIP[deviceID]; ok {
 		return ip, nil
 	}
 
@@ -66,29 +66,29 @@ func (a *VIPAllocator) Allocate(uuid string) (netip.Addr, error) {
 			continue
 		}
 		if _, taken := a.allocated[addr]; !taken {
-			a.allocated[addr] = uuid
-			a.uuidToIP[uuid] = addr
+			a.allocated[addr] = deviceID
+			a.deviceToIP[deviceID] = addr
 			_ = mask // used for clarity
 			return addr, nil
 		}
 	}
 }
 
-// Release removes the allocation for a UUID.
-func (a *VIPAllocator) Release(uuid string) {
+// Release removes the allocation for a device ID.
+func (a *VIPAllocator) Release(deviceID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if ip, ok := a.uuidToIP[uuid]; ok {
+	if ip, ok := a.deviceToIP[deviceID]; ok {
 		delete(a.allocated, ip)
-		delete(a.uuidToIP, uuid)
+		delete(a.deviceToIP, deviceID)
 	}
 }
 
-// GetIP returns the allocated IP for a UUID, or zero Addr if not allocated.
-func (a *VIPAllocator) GetIP(uuid string) (netip.Addr, bool) {
+// GetIP returns the allocated IP for a device ID, or zero Addr if not allocated.
+func (a *VIPAllocator) GetIP(deviceID string) (netip.Addr, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	ip, ok := a.uuidToIP[uuid]
+	ip, ok := a.deviceToIP[deviceID]
 	return ip, ok
 }
 

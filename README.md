@@ -1,6 +1,6 @@
 # tun-over-ws
 
-`tun-over-ws` 是一个基于 WebSocket 的三层 overlay 组网工具，Go 单二进制实现。运行时通过 `wsvpn server` 和 `wsvpn client` 两个子命令区分服务端和客户端。
+`tun-over-ws` 是一个基于 WebSocket 的三层 overlay 组网工具。服务端和客户端分别构建为 `wsvpns` 与 `wsvpnc`。
 
 它不是 SOCKS/HTTP 代理，而是通过 TUN 虚拟网卡接收原始 IPv4 包，把这些包放进 WebSocket binary frame，再由中心服务端按虚拟 IP 转发。
 
@@ -16,6 +16,7 @@
 - UDP 复用 WebSocket 池，但采用短等待、standby 突发和可丢弃策略。
 - 组播、广播、IGMP 等噪声流量过滤。
 - CDN/nginx 连接寿命探测和计划轮换；计划内关闭不会参与超时学习。
+- 管理控制台基础版：设备授权、AK/RK 设备认证、SQLite 设备持久化。
 
 已经验证：
 
@@ -29,8 +30,8 @@
 仍未实现：
 
 - 服务端出口（exit gateway）、server TUN、NAT 和默认路由接管。
-- 生产级认证；当前 UUID/token 只是开发测试字段。
-- ACL、审计日志、节点/VIP 持久化、配置热加载。
+- 生产级认证加固：HTTPS 部署、审计日志、ACL、密钥轮换。
+- 配置热加载。
 - Linux -> Windows TCP 方向吞吐仍偏低且重传较多，后续需要继续查 Windows TUN MTU、写入路径和分片行为。
 
 ## 构建
@@ -38,7 +39,8 @@
 Windows：
 
 ```powershell
-go build -o .\bin\wsvpn.exe .\cmd\wsvpn
+go build -o .\bin\wsvpns.exe .\cmd\wsvpns
+go build -o .\bin\wsvpnc.exe .\cmd\wsvpnc
 ```
 
 Linux amd64：
@@ -46,7 +48,8 @@ Linux amd64：
 ```powershell
 $env:GOOS = "linux"
 $env:GOARCH = "amd64"
-go build -o .\bin\wsvpn-linux-amd64 .\cmd\wsvpn
+go build -o .\bin\wsvpns-linux-amd64 .\cmd\wsvpns
+go build -o .\bin\wsvpnc-linux-amd64 .\cmd\wsvpnc
 Remove-Item Env:\GOOS
 Remove-Item Env:\GOARCH
 ```
@@ -60,19 +63,35 @@ go vet ./...
 
 Windows 运行客户端需要把 `wintun.dll` 放在 `bin\` 目录下。Linux 运行客户端需要 root 权限、`/dev/net/tun` 和 `iproute2`。
 
+## 管理台开发
+
+生产模式下 `wsvpns` 会使用嵌入的 `internal/admin/static` 前端资源。开发时前后端可以独立运行：
+
+```powershell
+# 后端
+go run .\cmd\wsvpns -c .\testdata\server.yaml --log-level debug
+
+# 前端
+cd .\www
+$env:VITE_API_TARGET = "http://127.0.0.1:18443"
+npm run dev
+```
+
+Vite 会代理 `/api` 和 `/tunnel` 到后端；如果想让浏览器跨域直连 API，可设置 `VITE_API_BASE`，并在服务端配置 `admin.dev_origin`。
+
 ## 本地 Windows 测试
 
 需要管理员 PowerShell。配置文件位于本地 `configs/` 目录，该目录不应提交。
 
 ```powershell
 # 终端 1：服务端
-.\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
+.\bin\wsvpns.exe -c .\configs\local\server.yaml --log-level debug
 
 # 终端 2：客户端 A，通常获得 10.66.0.2
-.\bin\wsvpn.exe client -c .\configs\local\client-a.yaml --log-level debug
+.\bin\wsvpnc.exe -c .\configs\local\client-a.yaml --log-level debug
 
 # 终端 3：客户端 B，通常获得 10.66.0.3
-.\bin\wsvpn.exe client -c .\configs\local\client-b.yaml --log-level debug
+.\bin\wsvpnc.exe -c .\configs\local\client-b.yaml --log-level debug
 
 # 终端 4：指定源地址测试 overlay
 ping -S 10.66.0.2 10.66.0.3
@@ -84,17 +103,17 @@ ping -S 10.66.0.2 10.66.0.3
 .\scripts\test-tun.ps1
 ```
 
-脚本会读取 `bin\wsvpn.exe` 和 `bin\wintun.dll`。
+脚本会读取 `bin\wsvpnc.exe`、`bin\wsvpns.exe` 和 `bin\wintun.dll`。
 
 ## 架构简图
 
 ```text
 Client A TUN (10.66.0.2)
-    -> wsvpn client
+    -> wsvpnc
     -> WebSocket binary frame
     -> Server relay (VIP allocation + overlay forwarding)
     -> WebSocket binary frame
-    -> wsvpn client
+    -> wsvpnc
     -> Client B TUN (10.66.0.3)
 ```
 
@@ -112,7 +131,8 @@ else:
 ## 项目结构
 
 ```text
-cmd/wsvpn/          CLI 入口（cobra server/client 子命令）
+cmd/wsvpns/   服务端 CLI 入口
+cmd/wsvpnc/   客户端 CLI 入口
 internal/
   config/           YAML 配置解析和基础校验
   conn/             客户端连接池、心跳、背压、重连、TUN/WS 数据泵
@@ -138,5 +158,5 @@ docs/               架构、运维、路线和交接文档
 不要提交或写入公开文档：
 
 - 远端公网 IP、SSH 地址、账号、密码、私钥、公钥路径。
-- 临时 token、真实配置文件、测试 URL。
+- 临时 AK/RK/JWT、真实配置文件、测试 URL。
 - `bin/`、`configs/`、`testdata/`、日志和抓包文件。

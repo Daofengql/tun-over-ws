@@ -6,7 +6,7 @@
 
 状态：已完成。
 
-- 单二进制、多角色：`wsvpn server` / `wsvpn client`。
+- 双二进制：`wsvpns` / `wsvpnc`。
 - Go 代码放在 `cmd/` 和 `internal/`，根目录不堆 `.go` 文件。
 - 明确两条长期数据路径：overlay 内网和服务端出口。
 - 建立 README、架构、运维、路线和交接文档。
@@ -16,7 +16,7 @@
 状态：已完成并有单元测试。
 
 - YAML 配置解析和默认值。
-- overlay CIDR、服务端地址、MTU、token 基础校验。
+- overlay CIDR、服务端地址、MTU 基础校验。
 - IPv4 包头解析。
 - source、destination、protocol 提取。
 - 短包、非 IPv4、错误 IHL、错误 total length 校验。
@@ -111,7 +111,7 @@
 
 目标：
 
-- 用服务端签名登录、节点密钥或证书替换测试 token。
+- 完善设备认证、管理员认证和生产密钥轮换策略。
 - 持久化节点身份和虚拟 IP。
 - ACL 和审计日志。
 - 限制客户端速率、连接频率和可访问目标。
@@ -121,7 +121,7 @@
 
 - VIP 由服务端统一分配。
 - 服务端校验 packet source IP 必须等于连接分配的 VIP。
-- 同一 UUID 可拥有多条连接，但共享一个服务端分配的 VIP。
+- 同一设备 ID 可拥有多条连接，但共享一个服务端分配的 VIP。
 
 ## 阶段 7：性能和传输扩展
 

@@ -20,7 +20,8 @@
 Windows：
 
 ```powershell
-go build -o .\bin\wsvpn.exe .\cmd\wsvpn
+go build -o .\bin\wsvpns.exe .\cmd\wsvpns
+go build -o .\bin\wsvpnc.exe .\cmd\wsvpnc
 ```
 
 Linux amd64：
@@ -28,7 +29,8 @@ Linux amd64：
 ```powershell
 $env:GOOS = "linux"
 $env:GOARCH = "amd64"
-go build -o .\bin\wsvpn-linux-amd64 .\cmd\wsvpn
+go build -o .\bin\wsvpns-linux-amd64 .\cmd\wsvpns
+go build -o .\bin\wsvpnc-linux-amd64 .\cmd\wsvpnc
 Remove-Item Env:\GOOS
 Remove-Item Env:\GOARCH
 ```
@@ -44,7 +46,7 @@ git diff --check
 Windows 客户端运行前确认：
 
 - 管理员 PowerShell。
-- `bin\wsvpn.exe` 存在。
+- `bin\wsvpnc.exe` 存在。
 - `bin\wintun.dll` 存在。
 
 Linux 客户端运行前确认：
@@ -67,10 +69,15 @@ server_tun:
   mtu: 1280
 exit:
   enabled: false
-auth:
-  tokens:
-    - "test-token-aaa"
-    - "test-token-bbb"
+database:
+  driver: "sqlite"
+  dsn: "./data/wsvpn.db"
+admin:
+  username: "admin"
+  password: "changeme"
+  jwt_secret: "replace-with-random-secret"
+  static_dir: ""      # 可选：开发时指向 www/dist；空值使用嵌入资源
+  dev_origin: ""      # 可选：例如 http://127.0.0.1:5173
 heartbeat:
   interval: 30s
 ```
@@ -79,8 +86,7 @@ heartbeat:
 
 ```yaml
 server_url: "ws://127.0.0.1:18443/tunnel"
-uuid: "client-a-00000000-0000-0000-0000-000000000001"
-token: "test-token-aaa"
+device_dir: "~/.wsvpn"
 tun:
   name: "wsvpn0"
   mtu: 1280
@@ -91,11 +97,27 @@ routes:
 
 注意：
 
-- 客户端不配置 `virtual_ip`，连接后由服务端分配。
+- 客户端不配置 `uuid`、`token` 或 `virtual_ip`；设备 ID 由 machine-id 派生，AK/RK 保存在 `device_dir/device.json`。
 - 服务端会跳过 `server_tun.ip`，默认第一个客户端拿到 `10.66.0.2`。
 - `server_tun.enabled` 当前不影响 overlay relay；exit 还未实现。
-- UUID/token 是开发测试字段，后续会替换为签名登录机制。
-- 真实配置文件、token、远端地址和临时 URL 不应提交。
+- 首次启动客户端会打印授权链接，需要管理员登录控制台批准设备。
+- 真实配置文件、AK/RK、管理员密码、远端地址和临时 URL 不应提交。
+
+## 管理台开发模式
+
+生产模式下服务端使用嵌入的 `internal/admin/static`。开发时可以让后端和 Vite 前端独立运行：
+
+```powershell
+# 终端 1：后端
+go run .\cmd\wsvpns -c .\testdata\server.yaml --log-level debug
+
+# 终端 2：前端
+cd .\www
+$env:VITE_API_TARGET = "http://127.0.0.1:18443"
+npm run dev
+```
+
+默认使用 Vite proxy 转发 `/api` 和 `/tunnel`。如果需要跨域直连 API，设置 `VITE_API_BASE` 并在服务端 `admin.dev_origin` 中填入前端来源。
 
 ## 本地 Windows Overlay 测试
 
@@ -103,13 +125,13 @@ routes:
 
 ```powershell
 # 终端 1：服务端
-.\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
+.\bin\wsvpns.exe -c .\configs\local\server.yaml --log-level debug
 
 # 终端 2：客户端 A
-.\bin\wsvpn.exe client -c .\configs\local\client-a.yaml --log-level debug
+.\bin\wsvpnc.exe -c .\configs\local\client-a.yaml --log-level debug
 
 # 终端 3：客户端 B
-.\bin\wsvpn.exe client -c .\configs\local\client-b.yaml --log-level debug
+.\bin\wsvpnc.exe -c .\configs\local\client-b.yaml --log-level debug
 
 # 终端 4：指定源地址 ping
 ping -S 10.66.0.2 10.66.0.3
@@ -130,7 +152,7 @@ ping -S 10.66.0.2 10.66.0.3
 
 ## Windows/Linux Overlay 测试
 
-跨平台测试使用本地配置文件，不在公开仓库中保存任何公网地址、连接 URL、临时 token 或主机信息。
+跨平台测试使用本地配置文件，不在公开仓库中保存任何公网地址、连接 URL、临时 AK/RK/JWT 或主机信息。
 
 Linux 指定源接口测试：
 
@@ -204,7 +226,8 @@ iperf3 -c 10.66.0.2 -B 10.66.0.3 -p 26001 -t 10 -u -b 10M -l 1000
 如果使用后台进程，可用这些命令收尾：
 
 ```bash
-pkill -x wsvpn || true
+pkill -x wsvpns || true
+pkill -x wsvpnc || true
 pkill -x iperf3 || true
 ip link show wsvpn0
 ```
@@ -219,7 +242,7 @@ ip link set dev wsvpn0 down 2>/dev/null || true
 Windows 停止本地测试进程：
 
 ```powershell
-Get-Process wsvpn,iperf3 -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process wsvpns,wsvpnc,iperf3 -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 ## 日志判断
@@ -352,8 +375,8 @@ ipv6: disabled in current version
 建议后续内置诊断命令：
 
 ```text
-wsvpn diag routes
-wsvpn diag tun
-wsvpn diag pool
-wsvpn diag server
+wsvpnc diag routes
+wsvpnc diag tun
+wsvpnc diag pool
+wsvpns diag server
 ```

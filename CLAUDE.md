@@ -2,25 +2,27 @@
 
 ## 项目定位
 
-`tun-over-ws` 是一个 Go 单二进制三层 overlay 组网工具。客户端通过 TUN 捕获原始 IPv4 包，并通过 WebSocket 连接中心服务端；服务端按虚拟 IP 转发包。
+`tun-over-ws` 是一个 Go 三层 overlay 组网工具。服务端和客户端分别构建为 `wsvpns` / `wsvpnc`。客户端通过 TUN 捕获原始 IPv4 包，并通过 WebSocket 连接中心服务端；服务端按虚拟 IP 转发包。
 
 当前范围：
 
 - overlay 客户端互通已经实现，并在 Windows/Linux 之间验证。
 - WebSocket 连接池已经改为固定大小 primary/standby 模型。
 - exit gateway 尚未实现。
-- UUID/token 只是开发测试身份字段，后续会替换为服务端签名登录。
+- 客户端不再配置 UUID/token；使用 machine-id 派生 device_id，设备认证使用 AK/RK，管理台登录使用 JWT。
 
 ## 构建和测试
 
 ```powershell
 go test -timeout 60s ./...
 go vet ./...
-go build -o .\bin\wsvpn.exe .\cmd\wsvpn
+go build -o .\bin\wsvpns.exe .\cmd\wsvpns
+go build -o .\bin\wsvpnc.exe .\cmd\wsvpnc
 
 $env:GOOS = "linux"
 $env:GOARCH = "amd64"
-go build -o .\bin\wsvpn-linux-amd64 .\cmd\wsvpn
+go build -o .\bin\wsvpns-linux-amd64 .\cmd\wsvpns
+go build -o .\bin\wsvpnc-linux-amd64 .\cmd\wsvpnc
 Remove-Item Env:\GOOS
 Remove-Item Env:\GOARCH
 ```
@@ -42,13 +44,13 @@ Remove-Item Env:\GOARCH
 
 ```powershell
 # 终端 1：服务端
-.\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
+.\bin\wsvpns.exe -c .\configs\local\server.yaml --log-level debug
 
 # 终端 2：客户端 A，通常拿到 10.66.0.2
-.\bin\wsvpn.exe client -c .\configs\local\client-a.yaml --log-level debug
+.\bin\wsvpnc.exe -c .\configs\local\client-a.yaml --log-level debug
 
 # 终端 3：客户端 B，通常拿到 10.66.0.3
-.\bin\wsvpn.exe client -c .\configs\local\client-b.yaml --log-level debug
+.\bin\wsvpnc.exe -c .\configs\local\client-b.yaml --log-level debug
 
 # 终端 4：指定源地址测试
 ping -S 10.66.0.2 10.66.0.3
@@ -56,7 +58,7 @@ ping -S 10.66.0.2 10.66.0.3
 
 ## 模块划分
 
-- `cmd/wsvpn/`：Cobra CLI 入口，提供 `server` 和 `client` 子命令。
+- `cmd/wsvpns/`、`cmd/wsvpnc/`：Cobra CLI 入口。
 - `internal/config/`：YAML 配置加载和校验。
 - `internal/packet/`：IPv4 包解析和 TCP/UDP/ICMP/噪声分类。
 - `internal/relay/`：服务端 WebSocket relay、VIP 分配、source 校验、primary/standby aware 转发。

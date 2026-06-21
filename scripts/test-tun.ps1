@@ -1,4 +1,4 @@
-# wsvpn 单机 TUN 测试脚本
+# wsvpns/wsvpnc 单机 TUN 测试脚本
 # 需要以管理员权限运行 PowerShell
 
 param(
@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 
 if ($Cleanup) {
     Write-Host "Cleaning up..." -ForegroundColor Yellow
-    Get-Process wsvpn -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process wsvpns, wsvpnc -ErrorAction SilentlyContinue | Stop-Process -Force
     route delete 10.66.0.0/24 2>$null
     Write-Host "Done." -ForegroundColor Green
     exit 0
@@ -26,34 +26,35 @@ if (-not $isAdmin) {
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 if (-not $ProjectDir) { $ProjectDir = $PSScriptRoot }
 $BinDir = Join-Path $ProjectDir "bin"
-$Exe = Join-Path $BinDir "wsvpn.exe"
+$ServerExe = Join-Path $BinDir "wsvpns.exe"
+$ClientExe = Join-Path $BinDir "wsvpnc.exe"
 $ServerCfg = Join-Path $ProjectDir "configs\local\server.yaml"
 $ClientACfg = Join-Path $ProjectDir "configs\local\client-a.yaml"
 $ClientBCfg = Join-Path $ProjectDir "configs\local\client-b.yaml"
 $WintunDll = Join-Path $BinDir "wintun.dll"
 
 # Verify files exist
-foreach ($f in @($Exe, $ServerCfg, $ClientACfg, $ClientBCfg, $WintunDll)) {
+foreach ($f in @($ServerExe, $ClientExe, $ServerCfg, $ClientACfg, $ClientBCfg, $WintunDll)) {
     if (-not (Test-Path $f)) {
         Write-Host "Missing: $f" -ForegroundColor Red
         exit 1
     }
 }
 
-Write-Host "=== wsvpn TUN test ===" -ForegroundColor Cyan
+Write-Host "=== wsvpns/wsvpnc TUN test ===" -ForegroundColor Cyan
 Write-Host "Killing old processes..."
-Get-Process wsvpn -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process wsvpns, wsvpnc -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 1
 
 # Start server
 Write-Host "Starting server..." -ForegroundColor Green
-$serverProc = Start-Process -FilePath $Exe -ArgumentList "server", "-c", $ServerCfg, "--log-level", "debug" -PassThru -NoNewWindow
+$serverProc = Start-Process -FilePath $ServerExe -ArgumentList "-c", $ServerCfg, "--log-level", "debug" -PassThru -NoNewWindow
 
 Start-Sleep -Seconds 1
 
 # Start client A
 Write-Host "Starting client A (wsvpn0, expects VIP 10.66.0.2)..." -ForegroundColor Green
-$clientAProc = Start-Process -FilePath $Exe -ArgumentList "client", "-c", $ClientACfg, "--log-level", "debug" -PassThru -NoNewWindow
+$clientAProc = Start-Process -FilePath $ClientExe -ArgumentList "-c", $ClientACfg, "--log-level", "debug" -PassThru -NoNewWindow
 
 Start-Sleep -Seconds 3
 
@@ -68,7 +69,7 @@ Write-Host "Client A running (PID: $($clientAProc.Id))" -ForegroundColor Green
 
 # Start client B
 Write-Host "Starting client B (wsvpn1, expects VIP 10.66.0.3)..." -ForegroundColor Green
-$clientBProc = Start-Process -FilePath $Exe -ArgumentList "client", "-c", $ClientBCfg, "--log-level", "debug" -PassThru -NoNewWindow
+$clientBProc = Start-Process -FilePath $ClientExe -ArgumentList "-c", $ClientBCfg, "--log-level", "debug" -PassThru -NoNewWindow
 
 Start-Sleep -Seconds 3
 

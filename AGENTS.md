@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-`tun-over-ws` 是一个 Go 单二进制三层组网工具。客户端创建 TUN 虚拟网卡，把原始 IPv4 包通过 WebSocket 发给中心 relay 服务端；服务端按虚拟 IP 转发 overlay 内网流量。
+`tun-over-ws` 是一个 Go 三层组网工具。客户端创建 TUN 虚拟网卡，把原始 IPv4 包通过 WebSocket 发给中心 relay 服务端；服务端按虚拟 IP 转发 overlay 内网流量。服务端和客户端分别构建为 `wsvpns` / `wsvpnc`。
 
 当前主线是 overlay 客户端互通。服务端出口（exit gateway）还没有实现。
 
@@ -25,7 +25,7 @@
 未实现或仍需谨慎处理：
 
 - exit gateway、server TUN、NAT 和默认路由接管。
-- 生产级认证；当前 UUID/token 只是开发测试字段。
+- 生产级认证加固；当前已有管理台 JWT、设备 AK/RK 和 machine-id 派生 device_id，仍需 HTTPS 部署、ACL、审计等生产能力。
 - ACL、审计日志、持久化节点/VIP、配置热加载。
 
 ## 目录约定
@@ -33,7 +33,8 @@
 ```text
 tun-over-ws/
   bin/                  构建产物，忽略提交
-  cmd/wsvpn/            Cobra CLI 入口
+  cmd/wsvpns/     服务端 Cobra CLI 入口
+  cmd/wsvpnc/     客户端 Cobra CLI 入口
   internal/
     config/             YAML 配置解析和校验
     conn/               客户端连接池、QoS 观测、背压、TUN 数据泵
@@ -63,18 +64,20 @@ tun-over-ws/
 3. 测试使用标准 `_test.go` 命名，优先运行 `go test ./...`。
 4. 配置格式只使用 YAML。
 5. 除非用户明确要求，否则不要开始 exit gateway 工作。
-6. 不要把 UUID/token 当成生产认证；后续会替换为服务端签名登录。
+6. 客户端不再配置 UUID/token；使用 machine-id 派生 device_id，设备认证使用 AK/RK，管理台登录使用 JWT。
 
 ## 常用命令
 
 ```powershell
 go test -timeout 60s ./...
 go vet ./...
-go build -o .\bin\wsvpn.exe .\cmd\wsvpn
+go build -o .\bin\wsvpns.exe .\cmd\wsvpns
+go build -o .\bin\wsvpnc.exe .\cmd\wsvpnc
 
 $env:GOOS = "linux"
 $env:GOARCH = "amd64"
-go build -o .\bin\wsvpn-linux-amd64 .\cmd\wsvpn
+go build -o .\bin\wsvpns-linux-amd64 .\cmd\wsvpns
+go build -o .\bin\wsvpnc-linux-amd64 .\cmd\wsvpnc
 Remove-Item Env:\GOOS
 Remove-Item Env:\GOARCH
 ```
@@ -82,9 +85,9 @@ Remove-Item Env:\GOARCH
 Windows 本地集成测试需要管理员 PowerShell：
 
 ```powershell
-.\bin\wsvpn.exe server -c .\configs\local\server.yaml --log-level debug
-.\bin\wsvpn.exe client -c .\configs\local\client-a.yaml --log-level debug
-.\bin\wsvpn.exe client -c .\configs\local\client-b.yaml --log-level debug
+.\bin\wsvpns.exe -c .\configs\local\server.yaml --log-level debug
+.\bin\wsvpnc.exe -c .\configs\local\client-a.yaml --log-level debug
+.\bin\wsvpnc.exe -c .\configs\local\client-b.yaml --log-level debug
 ping -S 10.66.0.2 10.66.0.3
 ```
 

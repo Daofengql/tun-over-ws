@@ -12,7 +12,18 @@ import (
 
 	"github.com/Daofengql/tun-over-ws/internal/config"
 	"github.com/Daofengql/tun-over-ws/internal/packet"
+	"github.com/Daofengql/tun-over-ws/internal/store"
 )
+
+func newTestStore(t *testing.T) store.Store {
+	t.Helper()
+	s, err := store.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
 
 func TestVIPAllocator(t *testing.T) {
 	serverIP := netip.MustParseAddr("10.66.0.1")
@@ -21,7 +32,7 @@ func TestVIPAllocator(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ip1, err := alloc.Allocate("uuid-1")
+	ip1, err := alloc.Allocate("device-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +40,7 @@ func TestVIPAllocator(t *testing.T) {
 		t.Fatalf("expected 10.66.0.2, got %s", ip1)
 	}
 
-	ip2, err := alloc.Allocate("uuid-2")
+	ip2, err := alloc.Allocate("device-2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,8 +48,8 @@ func TestVIPAllocator(t *testing.T) {
 		t.Fatalf("expected 10.66.0.3, got %s", ip2)
 	}
 
-	// Same UUID should get same IP.
-	ip1Again, err := alloc.Allocate("uuid-1")
+	// Same device ID should get same IP.
+	ip1Again, err := alloc.Allocate("device-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,8 +59,8 @@ func TestVIPAllocator(t *testing.T) {
 
 	// Server IP should be skipped.
 	for i := 0; i < 250; i++ {
-		uuid := "uuid-extra-" + string(rune('a'+i))
-		ip, err := alloc.Allocate(uuid)
+		deviceID := "device-extra-" + string(rune('a'+i))
+		ip, err := alloc.Allocate(deviceID)
 		if err != nil {
 			t.Fatalf("failed at %d: %v", i, err)
 		}
@@ -117,16 +128,13 @@ func TestRelayForwarding(t *testing.T) {
 		IP:  "10.66.0.1",
 		MTU: 1280,
 	}
-	cfg.Auth = config.AuthConfig{Tokens: []string{"test-token"}}
 	cfg.Heartbeat = config.HeartbeatConf{Interval: 30 * time.Second}
-
-	srv, err := NewServer(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Create a shared test store and seed it with devices.
+	testStore := newTestStore(t)
 
 	// Start server on random port.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -137,9 +145,35 @@ func TestRelayForwarding(t *testing.T) {
 	listener.Close()
 
 	cfg.Listen = addr
-	srv, _ = NewServer(cfg)
+	srv, err := NewServer(cfg, testStore)
+	if err != nil {
+		t.Fatal(err)
+	}
 	go srv.ListenAndServe(ctx)
 	time.Sleep(200 * time.Millisecond)
+
+	// Seed devices in the store with unique test AK hashes.
+	akHashA := hashToken("access-key-a")
+	akHashB := hashToken("access-key-b")
+	if err := testStore.CreateDevice(ctx, &store.Device{
+		DeviceID:   "test-a",
+		DeviceInfo: `{"os":"test"}`,
+		Status:     store.DeviceStatusApproved,
+		AutoVIP:    "10.66.0.2",
+	}); err != nil {
+		t.Fatal("create device A:", err)
+	}
+	testStore.UpdateDeviceKeys(ctx, "test-a", akHashA, "rk", time.Now().Add(time.Hour), time.Now().Add(24*time.Hour))
+
+	if err := testStore.CreateDevice(ctx, &store.Device{
+		DeviceID:   "test-b",
+		DeviceInfo: `{"os":"test"}`,
+		Status:     store.DeviceStatusApproved,
+		AutoVIP:    "10.66.0.3",
+	}); err != nil {
+		t.Fatal("create device B:", err)
+	}
+	testStore.UpdateDeviceKeys(ctx, "test-b", akHashB, "rk", time.Now().Add(time.Hour), time.Now().Add(24*time.Hour))
 
 	// Connect client A.
 	wsURL := "ws://" + addr + "/tunnel"
@@ -149,7 +183,7 @@ func TestRelayForwarding(t *testing.T) {
 	}
 
 	// Send hello from A.
-	helloA := `{"type":"hello","uuid":"test-a","token":"test-token","hostname":"host-a"}`
+	helloA := `{"type":"hello","device_id":"test-a","ak":"access-key-a","hostname":"host-a"}`
 	connA.Write(ctx, websocket.MessageText, []byte(helloA))
 
 	_, respA, err := connA.Read(ctx)
@@ -164,7 +198,7 @@ func TestRelayForwarding(t *testing.T) {
 		t.Fatal("dial B:", err)
 	}
 
-	helloB := `{"type":"hello","uuid":"test-b","token":"test-token","hostname":"host-b"}`
+	helloB := `{"type":"hello","device_id":"test-b","ak":"access-key-b","hostname":"host-b"}`
 	connB.Write(ctx, websocket.MessageText, []byte(helloB))
 
 	_, respB, err := connB.Read(ctx)
